@@ -110,8 +110,8 @@ def main():
 	check("R3 late failure (unknown item, after Lead/Contact/Address were written) -> 4xx and EVERYTHING rolled back", 400 <= c < 500 and counts(B) == ZERO, f"{c} {ra.short(b)} {counts(B)}")  # fmt: skip
 	c, b = sync.call("POST", CLAIM, json=body("3c", B, campaign="NOSUCHCAMPAIGN"))
 	check("R3 unknown campaign -> 4xx, nothing left", 400 <= c < 500 and counts(B) == ZERO, f"{c} {counts(B)}")
-	c, b = sync.call("POST", CLAIM, json=body("3d", B, items=[]))
-	check("R3 no items -> 4xx, nothing created", 400 <= c < 500 and counts(B) == ZERO, f"{c}")
+	c, b = sync.call("POST", CLAIM, json=body("3d", B, items=[{"item": ITEM, "qty": 0}]))
+	check("R3 explicit item with qty 0 -> 4xx, nothing created (an EMPTY items list now means 'use the Campaign's trial pack': see run_trial_item.py)", 400 <= c < 500 and counts(B) == ZERO, f"{c}")  # fmt: skip
 	c, b = sync.call("POST", CLAIM, json=body("3e", B, address=dict(body("x", B)["address"], pincode="160001")))
 	check("R3 pincode whose prefix maps to two states (Punjab/Chandigarh) and no address.state -> 4xx, nothing created", 400 <= c < 500 and "state" in str(b).lower() and counts(B) == ZERO, f"{c} {ra.short(b)}")  # fmt: skip
 	c, b = sync.call("POST", CLAIM, json=body("3f", B, address=dict(body("x", B)["address"], pincode="160001", state="Chandigarh")))

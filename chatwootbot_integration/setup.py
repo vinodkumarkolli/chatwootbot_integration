@@ -70,6 +70,14 @@ CRM_LEAD_FIELDS = [
 ]
 CRM_LEAD_FIELD_NAMES = [d["fieldname"] for d in CRM_LEAD_FIELDS]
 
+# Set by erase_subject when a Customer is kept under legal hold (sales records exist).
+CUSTOMER_FIELDS = [
+	dict(fieldname="custom_erasure_requested_on", fieldtype="Date", label="Erasure Requested On",
+		read_only=1, no_copy=1, insert_after="customer_group",
+		description="Set when an erasure was requested but the Customer is kept for its sales records."),
+]  # fmt: skip
+CUSTOMER_FIELD_NAMES = [d["fieldname"] for d in CUSTOMER_FIELDS]
+
 
 def before_install():
 	# The Trial Order permissions name these roles, so they must exist before doctypes sync.
@@ -188,7 +196,9 @@ def create_lead_fields():
 	for d in CRM_LEAD_FIELDS:
 		fields.append(dict(d, module=MODULE, insert_after=after))
 		after = d["fieldname"]
-	create_custom_fields({"CRM Lead": fields}, update=True)
+	create_custom_fields(
+		{"CRM Lead": fields, "Customer": [dict(d, module=MODULE) for d in CUSTOMER_FIELDS]}, update=True
+	)
 
 
 def grant_cleanup_permissions():
@@ -223,14 +233,13 @@ def ensure_cleanup_user():
 
 def before_uninstall():
 	"""Leave no orphans: custom fields, Cleanup Role permission rows, the user, the role."""
-	for name in frappe.get_all(
-		"Custom Field", filters={"dt": "CRM Lead", "fieldname": ["in", CRM_LEAD_FIELD_NAMES]}, pluck="name"
-	):
-		frappe.delete_doc("Custom Field", name, force=True, ignore_permissions=True)
-	# Deleting a Custom Field leaves its column behind in the table: drop ours.
-	for fieldname in CRM_LEAD_FIELD_NAMES:
-		if frappe.db.has_column("CRM Lead", fieldname):
-			frappe.db.sql_ddl(f"alter table `tabCRM Lead` drop column `{fieldname}`")
+	for doctype, names in (("CRM Lead", CRM_LEAD_FIELD_NAMES), ("Customer", CUSTOMER_FIELD_NAMES)):
+		for name in frappe.get_all("Custom Field", filters={"dt": doctype, "fieldname": ["in", names]}, pluck="name"):
+			frappe.delete_doc("Custom Field", name, force=True, ignore_permissions=True)
+		# Deleting a Custom Field leaves its column behind in the table: drop ours.
+		for fieldname in names:
+			if frappe.db.has_column(doctype, fieldname):
+				frappe.db.sql_ddl(f"alter table `tab{doctype}` drop column `{fieldname}`")
 	heal_own_doctype_perms()
 	frappe.db.delete("Custom DocPerm", {"role": ["in", [CLEANUP_ROLE, CRM_ROLE]]})
 	for doctype in {*CLEANUP_PERMS, *CRM_PERMS}:

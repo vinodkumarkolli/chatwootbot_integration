@@ -14,4 +14,5 @@ before_uninstall = "chatwootbot_integration.setup.before_uninstall"
 
 doc_events = {
 	"CRM Lead": {"validate": "chatwootbot_integration.lead_events.keep_first_values"},
+	"Campaign": {"validate": "chatwootbot_integration.campaign_events.validate_free_trial"},
 }

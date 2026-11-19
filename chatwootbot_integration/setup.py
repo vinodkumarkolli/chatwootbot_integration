@@ -78,6 +78,18 @@ CUSTOMER_FIELDS = [
 ]  # fmt: skip
 CUSTOMER_FIELD_NAMES = [d["fieldname"] for d in CUSTOMER_FIELDS]
 
+# Which Item is the free trial pack of a Campaign (record_claim reads it when the bot sends no items).
+# The Link filter is only a UI hint; chatwootbot_integration.campaign_events enforces it on save.
+CAMPAIGN_FIELDS = [
+	dict(fieldname="custom_free_trial", fieldtype="Check", label="Free Trial", default="0",
+		insert_after="campaign_name"),
+	dict(fieldname="custom_trial_item", fieldtype="Link", options="Item", label="Trial Item",
+		depends_on="eval:doc.custom_free_trial", mandatory_depends_on="eval:doc.custom_free_trial",
+		link_filters='[["Item","disabled","=",0],["Item","is_sales_item","=",1]]',
+		insert_after="custom_free_trial"),
+]  # fmt: skip
+CAMPAIGN_FIELD_NAMES = [d["fieldname"] for d in CAMPAIGN_FIELDS]
+
 
 def before_install():
 	# The Trial Order permissions name these roles, so they must exist before doctypes sync.
@@ -101,7 +113,7 @@ def setup_all():
 	ensure_crm_role()
 	seed_conversation_intents()
 	seed_campaign()
-	create_lead_fields()
+	create_app_custom_fields()
 	grant_cleanup_permissions()
 	grant_crm_permissions()
 	ensure_cleanup_user()
@@ -187,7 +199,7 @@ def _grant_row(doctype, role, ptypes, if_owner=False):
 	frappe.clear_cache(doctype=doctype)
 
 
-def create_lead_fields():
+def create_app_custom_fields():
 	# Chain the fields in order, after the last field that is not ours.
 	meta = frappe.get_meta("CRM Lead")
 	mine = set(CRM_LEAD_FIELD_NAMES)
@@ -197,7 +209,12 @@ def create_lead_fields():
 		fields.append(dict(d, module=MODULE, insert_after=after))
 		after = d["fieldname"]
 	create_custom_fields(
-		{"CRM Lead": fields, "Customer": [dict(d, module=MODULE) for d in CUSTOMER_FIELDS]}, update=True
+		{
+			"CRM Lead": fields,
+			"Customer": [dict(d, module=MODULE) for d in CUSTOMER_FIELDS],
+			"Campaign": [dict(d, module=MODULE) for d in CAMPAIGN_FIELDS],
+		},
+		update=True,
 	)
 
 
@@ -233,7 +250,11 @@ def ensure_cleanup_user():
 
 def before_uninstall():
 	"""Leave no orphans: custom fields, Cleanup Role permission rows, the user, the role."""
-	for doctype, names in (("CRM Lead", CRM_LEAD_FIELD_NAMES), ("Customer", CUSTOMER_FIELD_NAMES)):
+	for doctype, names in (
+		("CRM Lead", CRM_LEAD_FIELD_NAMES),
+		("Customer", CUSTOMER_FIELD_NAMES),
+		("Campaign", CAMPAIGN_FIELD_NAMES),
+	):
 		for name in frappe.get_all("Custom Field", filters={"dt": doctype, "fieldname": ["in", names]}, pluck="name"):
 			frappe.delete_doc("Custom Field", name, force=True, ignore_permissions=True)
 		# Deleting a Custom Field leaves its column behind in the table: drop ours.

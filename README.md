@@ -59,6 +59,33 @@ Rollback: `u.add_roles("Sales User"); u.remove_roles("CRM User Custom")`, and re
 in trial_order.json (git revert of the permissions commit) before `bench migrate`.
 Re-add `Sales User` BEFORE uninstalling the app (uninstall deletes the role and its assignments).
 
+## upsert_lead and record_claim (for Windmill)
+
+`chatwootbot_integration.api.upsert_lead(mobile_no, first_name, last_name, lead_owner, status, campaign, intent,
+conversation_id, consent_at, policy_version, chatwoot_contact_id, marketing_opt_in, whatsapp_verified, with_contact=False)`
+finds the CRM Lead for an E.164 number (last 10 digits, any spelling; the Sarvam gate user also finds Leads owned by
+others - nobody else does) or creates it. `with_contact=True` also finds-or-creates the Contact for the same number and
+links it, atomically. Returns `{name, created, updated_fields}` (+ `contact`, `contact_created`).
+Windmill must update Leads through this method: a plain REST PUT is refused for a Lead owned by someone else.
+
+`chatwootbot_integration.api.record_claim(bot_ref, mobile_no, first_name, lead_owner, status, campaign, intent,
+consent_at, address, items, last_name, first_intent, chatwoot_contact_id, chatwoot_conversation_id, whatsapp_verified,
+marketing_opt_in, policy_version, terms_message_id, claim_message_id)` (role `CRM User Custom`) records a whole claim in
+ONE transaction: upsert Lead and Contact, find-or-create the Address linked to the Lead (match on pincode + house_no +
+street; stored as address_line1 = house_no[, building_name], address_line2 = street[, landmark]), create the Trial
+Order idempotently by `bot_ref`, keep `custom_trial_order_count`. Returns
+`{lead, contact, address, trial_order, created: {lead, contact, address, trial_order}}`.
+
+- Replaying a `bot_ref` returns the existing documents, creates and changes nothing (the same `bot_ref` for another number
+  is refused: 409 `DUPLICATE_BOT_REF`).
+- Any failure, even after the Lead was written, rolls back everything this call created.
+- Errors: 422 `CallerBlockedError` (`CALLER_BLOCKED: reason=...`) for a blocked/foreign number; 417 validation errors
+  (pincode `^[1-9][0-9]{5}$`, items, consent_at, unknown campaign/item/intent); 403 for a caller without the role, or a
+  non-gate caller meeting a Lead owned by someone else.
+- India Compliance requires a state on an Indian Address. It is `address.state` if sent, otherwise derived from the pincode
+  with India Compliance's own pincode table when the first three digits belong to exactly one state; if not (e.g.
+  Punjab/Chandigarh), the call fails with a clear message and creates nothing: send `address.state`.
+
 ## erase_subject
 
 `chatwootbot_integration.api.erase_subject(mobile_no, bot_refs=[], dry_run=False, confirm_quotations=False)`
@@ -98,6 +125,7 @@ that a real run also purges.)
     ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_acceptance.py <site>            # REST, SYNC_ROLE="CRM User Custom" for the post-swap world
     ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_erasure_scenarios.py <site>     # erasure scenarios, dry_run, hold catch-all
     ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_real_user_inprocess.py <site>   # gate-user bypass as the real automation.crm
+    ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_record_claim.py <site>          # record_claim and upsert_lead(with_contact)
 
 Do not uninstall/reinstall the app on a site whose `automation.cleanup@sravie.in` already has API keys: uninstall
 deletes that user (and its keys).

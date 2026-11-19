@@ -1,0 +1,1 @@
+chatwootbot_integration.patches.v1_0.setup_identities

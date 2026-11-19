@@ -126,6 +126,17 @@ def main():
 	address = b.get("data", {}).get("name")
 	check("4c create Address linked to Lead", c == 200 and address, f"{c} {address or short(b)}")
 
+	if not temp:  # only the REAL gate user (automation.crm) is subject to the caller gate
+		print("\n== caller gate as the real automation.crm: a non-+91 number must be refused ==")
+		FOREIGN = "+14155550123"
+		c, b = sync.call("POST", "/api/resource/CRM Lead", json={"first_name": "Zzgate Foreign", "mobile_no": FOREIGN, "lead_owner": owner, "status": status})
+		check("gate: REST CRM Lead with a non-+91 number is refused (403 from the gate's permission hook, or CALLER_BLOCKED)", 400 <= c < 500 and ("CALLER_BLOCKED" in str(b) or b.get("exc_type") == "PermissionError"), f"{c} {short(b)}")  # fmt: skip
+		c, b = sync.call("POST", "/api/resource/Contact", json={"first_name": "Zzgate Foreign", "mobile_no": FOREIGN, "phone_nos": [{"phone": FOREIGN, "is_primary_mobile_no": 1}]})
+		check("gate: REST Contact with a non-+91 number is refused", 400 <= c < 500 and ("CALLER_BLOCKED" in str(b) or b.get("exc_type") == "PermissionError"), f"{c} {short(b)}")  # fmt: skip
+		fresh()
+		check("gate: nothing was created for the non-+91 number", not frappe.db.exists("CRM Lead", {"mobile_no": FOREIGN}) and not frappe.db.exists("Contact", {"mobile_no": FOREIGN}), "")  # fmt: skip
+		clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": FOREIGN})  # tidy, in case a guard let one through
+
 	print("\n== 1/2/3 Trial Order ==")
 	c, b = sync.call("POST", "/api/resource/Trial Order", json=order(address=address))
 	to = b.get("data", {}).get("name", "")
@@ -147,10 +158,17 @@ def main():
 	check("7 unknown intent rejected", 400 <= c < 500, f"{c} {short(b)}")
 	c, b = sync.call("POST", "/api/resource/Trial Order", json=order(bot_ref="TR-X" + uuid.uuid4().hex[:6], campaign="NOSUCHCAMPAIGN"))
 	check("7 unknown campaign rejected", 400 <= c < 500, f"{c} {short(b)}")
-	c, b = sync.call("PUT", f"/api/resource/CRM Lead/{lead}", json={"custom_latest_intent": "info", "custom_first_intent": "other", "custom_first_conversation_id": "conv-2"})
+	c, b = sync.call("POST", "/api/method/chatwootbot_integration.api.upsert_lead", json={"mobile_no": PHONE, "intent": "info", "conversation_id": "conv-2"})
 	fresh()
 	row = frappe.db.get_value("CRM Lead", lead, ["custom_first_intent", "custom_latest_intent", "custom_first_conversation_id"], as_dict=True)
-	check("7 latest_intent updates, first_intent / first_conversation_id unchanged", c == 200 and row.custom_first_intent == "trial_claim" and row.custom_latest_intent == "info" and row.custom_first_conversation_id == "conv-1", f"{c} {dict(row)}")  # fmt: skip
+	check("7 upsert_lead: latest_intent updates, first_intent / first_conversation_id unchanged", c == 200 and row.custom_first_intent == "trial_claim" and row.custom_latest_intent == "info" and row.custom_first_conversation_id == "conv-1", f"{c} {dict(row)}")  # fmt: skip
+	c, b = sync.call("PUT", f"/api/resource/CRM Lead/{lead}", json={"custom_first_intent": "other", "custom_first_conversation_id": "conv-3"})
+	fresh()
+	row = frappe.db.get_value("CRM Lead", lead, ["custom_first_intent", "custom_first_conversation_id"], as_dict=True)
+	if c == 200:
+		check("7 plain PUT cannot overwrite first_intent / first_conversation_id (hook)", row.custom_first_intent == "trial_claim" and row.custom_first_conversation_id == "conv-1", f"{c} {dict(row)}")  # fmt: skip
+	else:
+		print(f"[INFO] 7 plain PUT on a Lead owned by another user -> {c} (own/assigned rule); updates must go through upsert_lead")
 	c, b = sync.call("POST", "/api/resource/Campaign", json={"campaign_name": "ZZNEWCAMP"})
 	check("sync user cannot create a Campaign", c == 403, f"{c}")
 	c, b = sync.call("GET", "/api/resource/Campaign")
@@ -196,10 +214,11 @@ def main():
 	m = b.get("message") or {}
 	fresh()
 	n = frappe.db.count("CRM Lead", {"mobile_no": P4})
-	fresh()
-	n = frappe.db.count("CRM Lead", {"mobile_no": P4})
 	r = frappe.db.get_value("CRM Lead", foreign_lead, ["custom_latest_intent", "custom_policy_version", "custom_campaign"], as_dict=True)
-	check("upsert_lead, caller is NOT the gate user: another user's Lead is refused (403), not duplicated, not changed", c == 403 and b.get("exc_type") == "PermissionError" and n == 1 and not r.custom_latest_intent and not r.custom_policy_version and not r.custom_campaign, f"{c} {short(b)} count={n} {dict(r)}")  # fmt: skip
+	if temp:
+		check("upsert_lead, caller is NOT the gate user: another user's Lead is refused (403), not duplicated, not changed", c == 403 and b.get("exc_type") == "PermissionError" and n == 1 and not r.custom_latest_intent and not r.custom_policy_version and not r.custom_campaign, f"{c} {short(b)} count={n} {dict(r)}")  # fmt: skip
+	else:
+		check("upsert_lead, caller IS the gate user (real automation.crm): another user's Lead is found, updated, NOT duplicated", c == 200 and m.get("name") == foreign_lead and m.get("created") is False and n == 1 and r.custom_latest_intent == "info" and r.custom_policy_version == "v2" and r.custom_campaign == campaign, f"{c} {m} count={n}")  # fmt: skip
 	print("   (the gate-user bypass is tested by acceptance/run_real_user_inprocess.py)")
 	P5 = "+919900000005"
 	c, b = sync.call("POST", U, json={"mobile_no": P5, "first_name": "Zzupsert New", "lead_owner": owner, "status": status, "intent": "trial_claim", "conversation_id": "conv-9", "campaign": campaign, "consent_at": "2026-11-19 10:00:00", "policy_version": "v1"})

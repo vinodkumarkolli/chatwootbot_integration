@@ -196,9 +196,11 @@ def main():
 	m = b.get("message") or {}
 	fresh()
 	n = frappe.db.count("CRM Lead", {"mobile_no": P4})
-	check("upsert_lead finds a Lead owned by another user: same name, created=False, not duplicated", c == 200 and m.get("name") == foreign_lead and m.get("created") is False and n == 1, f"{c} {m} count={n} {short(b) if c != 200 else ''}")  # fmt: skip
-	r = frappe.db.get_value("CRM Lead", foreign_lead, ["custom_latest_intent", "custom_first_intent", "custom_policy_version", "custom_campaign"], as_dict=True)
-	check("upsert_lead updates latest_intent/policy/campaign on the existing Lead; first_intent stays unset", r.custom_latest_intent == "info" and r.custom_policy_version == "v2" and r.custom_campaign == campaign and not r.custom_first_intent, str(dict(r)))  # fmt: skip
+	fresh()
+	n = frappe.db.count("CRM Lead", {"mobile_no": P4})
+	r = frappe.db.get_value("CRM Lead", foreign_lead, ["custom_latest_intent", "custom_policy_version", "custom_campaign"], as_dict=True)
+	check("upsert_lead, caller is NOT the gate user: another user's Lead is refused (403), not duplicated, not changed", c == 403 and b.get("exc_type") == "PermissionError" and n == 1 and not r.custom_latest_intent and not r.custom_policy_version and not r.custom_campaign, f"{c} {short(b)} count={n} {dict(r)}")  # fmt: skip
+	print("   (the gate-user bypass is tested by acceptance/run_real_user_inprocess.py)")
 	P5 = "+919900000005"
 	c, b = sync.call("POST", U, json={"mobile_no": P5, "first_name": "Zzupsert New", "lead_owner": owner, "status": status, "intent": "trial_claim", "conversation_id": "conv-9", "campaign": campaign, "consent_at": "2026-11-19 10:00:00", "policy_version": "v1"})
 	m = b.get("message") or {}

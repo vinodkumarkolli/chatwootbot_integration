@@ -345,9 +345,6 @@ def _delete_where(doctype, condition, values):
 
 # =============================================================== upsert_lead
 
-SYNC_ROLE = "CRM User Custom"
-
-
 class CallerBlockedError(frappe.ValidationError):
 	"""The number is on the blocked list or is not an Indian number (BR-CRM-002).
 	HTTP 422; the message always starts with the fixed token `CALLER_BLOCKED:`."""
@@ -389,9 +386,10 @@ def upsert_lead(
 	- the Lead is found on the last 10 digits of `mobile_no`/`phone`, any spelling
 	  (`voice_agent._find_lead`) and, like `caller_gate.lookup_by_phone`, WITHOUT the
 	  own/assigned-records restriction, so a Lead owned by another user is still found
-	  (a plain REST filter cannot see it) - for the configured Sarvam automation user
-	  and for CRM automation accounts holding role `CRM User Custom`; anyone
-	  else must be able to read the Lead normally;
+	  (a plain REST filter cannot see it) - for the configured Sarvam gate user ONLY
+	  (`Sarvam Voice Agent Settings.caller_gate_automation_user`). Any other caller,
+	  including holders of `CRM User Custom`, must be able to read the Lead normally,
+	  otherwise `PermissionError` (and nothing is created or changed);
 	- BR-CRM-002: a blocked or foreign number raises `CallerBlockedError`
 	  (HTTP 422, message `CALLER_BLOCKED: reason=...; mobile_no=...`), on create and update;
 	- BR-CRM-001 and the phone normalisation run as the CRM Lead's own hooks on insert.
@@ -432,7 +430,7 @@ def upsert_lead(
 	}
 	values = {k: v for k, v in values.items() if v not in (None, "")}
 
-	bypass = frappe.session.user == get_automation_user() or SYNC_ROLE in frappe.get_roles()
+	bypass = frappe.session.user == get_automation_user()
 	last10 = last_10_digits(phone)
 
 	existing = _find_lead(last10)

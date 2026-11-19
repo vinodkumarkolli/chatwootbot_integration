@@ -59,24 +59,45 @@ Rollback: `u.add_roles("Sales User"); u.remove_roles("CRM User Custom")`, and re
 in trial_order.json (git revert of the permissions commit) before `bench migrate`.
 Re-add `Sales User` BEFORE uninstalling the app (uninstall deletes the role and its assignments).
 
-## erase_subject and the legal hold
+## erase_subject
 
-`chatwootbot_integration.api.erase_subject(mobile_no, bot_refs=[])` (Cleanup Role only) erases the subject's
-Trial Orders, Address/Contact, CRM Lead (anonymised instead if a Deal, Call Log, ... references it) and the
-Deleted Document / Version / Comment / Activity Log / File / CRM Notification rows. It runs in one transaction
-and re-running it is a no-op.
+`chatwootbot_integration.api.erase_subject(mobile_no, bot_refs=[], dry_run=False, confirm_quotations=False)`
+(Cleanup Role only). One transaction; re-running is a no-op. There is no scheduled purge anywhere in this app.
 
-Legal hold: inside the method, with ignore_permissions, the subject's Customers are found (Customer.mobile_no, or a
-Customer linked from the subject's Contacts). If a Customer has any Sales Order, Sales Invoice, Delivery Note
-(any docstatus) or Payment Entry, the Lead and Trial Orders are still deleted but the Customer is KEPT, with the
-Contact/Address that those sales documents point at; `Customer.custom_erasure_requested_on` is set (once) and the
-response carries `held: [...]` and `hold_reason: "sales records"`. Everything else of the subject is erased, and
-the audit trail (Version/Comment/Activity Log) of the held documents is never purged.
-Minimisation of the held side: on the held Customer and its kept Contact/Address only what the invoice itself
-carries (name, address) stays. Cleared: Customer mobile_no/email_id, the Contact's phone/mobile/WhatsApp rows and
-email rows, the Address's phone/email/fax, and the re-rendered Customer primary_address. The Customer is disabled
-and the Contact marked unsubscribed. Because the channels are gone, a repeat call can no longer find the Customer
-and is a plain no-op. NOT touched: submitted sales documents (they keep their own snapshot of the contact phone,
-email and address display), the accounting ledgers, and the names.
-A Customer WITHOUT sales records is not deleted yet; it is reported under `retained`.
-There is no scheduled purge anywhere in this app.
+**Always erased:** the subject's Trial Orders, Contact/Address, CRM Lead, and the Deleted Document, Version,
+Comment, Activity Log, File, Communication, Integration Request, ToDo, Notification and CRM Notification rows about
+them. A Lead is anonymised instead of deleted only if something other than its own initial-status Deals and
+Quotations still points at it.
+
+**Legal hold** - a Customer with ANY of Sales Order, Sales Invoice, Delivery Note, POS Invoice, Payment Entry,
+Journal Entry (party) or GL Entry (any docstatus) is KEPT, with the Contact/Address those documents point at.
+It is minimised: Customer mobile/email, the Contact's phone/mobile/WhatsApp/email rows and the Address's
+phone/email/fax are cleared, the Customer is disabled, the Contact unsubscribed, `Customer.custom_erasure_requested_on`
+set; the audit trail of held documents is never purged. Response: `held: [...]`, `hold_reason: "sales records"`.
+Not touched: the submitted documents' own snapshot of phone/email/address, the ledgers, the names.
+
+**Customer without those records** (and the subject's Deals and Quotations) are erased only when it is safe:
+every Quotation draft or cancelled, every Deal still at its initial status (Qualification), Customer Type not
+Company. Deals go with their Tasks and Notes. If a Customer cannot be deleted because something else points at it
+(e.g. a Timesheet) it is anonymised and renamed `Erased-<hash>`, and the blockers are listed.
+
+**needs_review** - if any Quotation is submitted, any Deal is past its initial status, or the Customer is a
+Company, nothing of that kind is touched; only the safe part runs (Trial Orders, Contact/Address, Lead,
+held-side minimisation) and `needs_review: [{doctype, name, reason}]` says why. `confirm_quotations=True` clears
+ONLY the "submitted Quotation" reason (they are cancelled, then deleted); later-stage Deals and Company
+customers always stay for a human.
+
+**dry_run=True** changes nothing and returns `{would_delete, would_anonymise, would_cancel, held, needs_review,
+retained, would_purge}`. It runs the same code path as a real run, recording instead of acting, so the plan
+cannot drift. (`would_purge` counts rows existing now; the deletions themselves add Deleted Document/Version rows
+that a real run also purges.)
+
+## Tests
+
+    cd sites
+    ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_acceptance.py <site>            # REST, SYNC_ROLE="CRM User Custom" for the post-swap world
+    ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_erasure_scenarios.py <site>     # erasure scenarios, dry_run, hold catch-all
+    ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_real_user_inprocess.py <site>   # gate-user bypass as the real automation.crm
+
+Do not uninstall/reinstall the app on a site whose `automation.cleanup@sravie.in` already has API keys: uninstall
+deletes that user (and its keys).

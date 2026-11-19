@@ -714,6 +714,14 @@ def _purge(owned, mobile_no, bot_refs, protected, execute):
 		)
 		count("Communication", _remove_named("Communication", names, execute))
 
+	# Naming-series counters keyed on a Contact/Address name carry the person's name too
+	# (e.g. `Ravi Kumar-Shipping`). Drop the counter only when no other record still uses that key.
+	for dt, name in owned:
+		if dt in ("Contact", "Address"):
+			key = re.sub(r"-\d+$", "", name)
+			if not frappe.db.sql(f"select 1 from `tab{dt}` where name like %s limit 1", (key + "%",)):
+				count("Series", _purge_rows("Series", "`name` in (%s, %s)", [key, key + "-"], execute))
+
 	# Contact and Address names embed the person's name; Frappe's "Deleted" feed Comment
 	# for them carries that name in its text and has no reference_name to match on.
 	needles = [last_10_digits(mobile_no) or mobile_no, *bot_refs]

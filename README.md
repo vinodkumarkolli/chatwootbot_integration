@@ -76,6 +76,13 @@ street; stored as address_line1 = house_no[, building_name], address_line2 = str
 Order idempotently by `bot_ref`, keep `custom_trial_order_count`. Returns
 `{lead, contact, address, trial_order, created: {lead, contact, address, trial_order}}`.
 
+- `items` is optional. When omitted or empty it is built from the Campaign named in `campaign`:
+  `[{"item": Campaign.custom_trial_item, "qty": 1}]` (an explicit `items` always wins). The Campaign is read with
+  `frappe.db.get_value`, so the calling identity needs no read access to Campaign. Errors, all HTTP 417
+  `ValidationError`, message starts with the code and never contains a phone number:
+  `CAMPAIGN_NOT_FOUND: <campaign>`, `CAMPAIGN_NO_TRIAL: <campaign>` (free trial off, or no Item),
+  `TRIAL_ITEM_DISABLED: <item>` (the Item was disabled after the Campaign was saved). A replay of a `bot_ref`
+  never re-reads the Campaign.
 - Replaying a `bot_ref` returns the existing documents, creates and changes nothing (the same `bot_ref` for another number
   is refused: 409 `DUPLICATE_BOT_REF`).
 - Any failure, even after the Lead was written, rolls back everything this call created.
@@ -85,6 +92,15 @@ Order idempotently by `bot_ref`, keep `custom_trial_order_count`. Returns
 - India Compliance requires a state on an Indian Address. It is `address.state` if sent, otherwise derived from the pincode
   with India Compliance's own pincode table when the first three digits belong to exactly one state; if not (e.g.
   Punjab/Chandigarh), the call fails with a clear message and creates nothing: send `address.state`.
+
+## Campaign: free trial and trial Item
+
+Custom fields on Campaign (created on install, and by patch `add_campaign_free_trial_fields` on existing sites):
+`custom_free_trial` (Check, default 0) and `custom_trial_item` (Link to Item; shown and mandatory only when
+Free Trial is set; the link filter `disabled = 0, is_sales_item = 1` is a UI hint). `Campaign.validate`
+(`campaign_events.validate_free_trial`) enforces it server-side: Free Trial set requires an existing, enabled Item;
+Free Trial unset clears the Item. People create Campaigns; the sync identity only reads them (and `record_claim`
+reads them for it).
 
 ## erase_subject
 
@@ -126,6 +142,7 @@ that a real run also purges.)
     ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_erasure_scenarios.py <site>     # erasure scenarios, dry_run, hold catch-all
     ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_real_user_inprocess.py <site>   # gate-user bypass as the real automation.crm
     ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_record_claim.py <site>          # record_claim and upsert_lead(with_contact)
+    ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_trial_item.py <site>            # Campaign trial item, validation, error codes
 
 Do not uninstall/reinstall the app on a site whose `automation.cleanup@sravie.in` already has API keys: uninstall
 deletes that user (and its keys).

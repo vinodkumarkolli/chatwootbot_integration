@@ -79,7 +79,7 @@ Not touched: the submitted documents' own snapshot of phone/email/address, the l
 **Customer without those records** (and the subject's Deals and Quotations) are erased only when it is safe:
 every Quotation draft or cancelled, every Deal still at its initial status (Qualification), Customer Type not
 Company. Deals go with their Tasks and Notes. If a Customer cannot be deleted because something else points at it
-(e.g. a Timesheet) it is anonymised and renamed `Erased-<hash>`, and the blockers are listed.
+(e.g. a Timesheet) it is anonymised and renamed `Erased-` + 12 random hex characters (48 bits from `secrets`, no input, not derived from any personal value), and the blockers are listed.
 
 **needs_review** - if any Quotation is submitted, any Deal is past its initial status, or the Customer is a
 Company, nothing of that kind is touched; only the safe part runs (Trial Orders, Contact/Address, Lead,

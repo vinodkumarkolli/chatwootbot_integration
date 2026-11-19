@@ -178,12 +178,33 @@ def main():
 		cu = frappe.db.get_value("Customer", new, ["customer_name", "mobile_no", "email_id", "disabled"], as_dict=True)
 		check("S7 anonymised Customer: name 'Erased-...', mobile/email cleared, disabled; the Timesheet now points at the new name", cu.customer_name.startswith("Erased") and not cu.mobile_no and not cu.email_id and cu.disabled == 1 and frappe.db.get_value("Timesheet", "ZZ-TS-1", "customer") == new, str(dict(cu)))  # fmt: skip
 
+	print("\n== S7b the anonymised name is a random token, not derived from the person ==")
+	import inspect
+	import re
+
+	from chatwootbot_integration.api import ERASED_NAME, _erasure_name
+
+	check("token generator takes no input (so it cannot be derived from personal data)", not inspect.signature(_erasure_name).parameters, "")
+	sample = {_erasure_name() for _ in range(2000)}
+	check("2000 tokens: all unique, all 'Erased-' + 12 lowercase hex", len(sample) == 2000 and all(ERASED_NAME.match(t) for t in sample), f"{len(sample)} unique")  # fmt: skip
+	P2 = "+919900000055"
+	c7b = customer("Zzera Blocked Customer", P2) if not frappe.db.exists("Customer", "Zzera Blocked Customer") else customer("Zzera Blocked Customer Two", P2)
+	frappe.get_doc({"doctype": "Timesheet", "name": "ZZ-TS-2", "customer": c7b, "docstatus": 0}).db_insert()
+	made["rows"].append(("Timesheet", "ZZ-TS-2"))
+	frappe.db.commit()
+	code, m2, b = erase(P2)
+	an2 = [a for a in m2.get("anonymised", []) if a["doctype"] == "Customer"]
+	t1, t2 = new, (an2[0].get("renamed_to") if an2 else None)
+	check("real anonymisations: name matches the token format and contains nothing of the old name or the phone", t2 and ERASED_NAME.match(t2) and "zzera" not in t2.lower() and "blocked" not in t2.lower() and "9900000055" not in t2, str(t2))  # fmt: skip
+	check("two anonymisations of near-identical Customers got different tokens", t1 and t2 and t1 != t2, f"{t1} vs {t2}")  # fmt: skip
+	check("S7 token also matches the strict format", t1 and ERASED_NAME.match(t1), str(t1))
+
 	print("\n== teardown of what the API (rightly) refused to erase, then the leftover sweep ==")
 	teardown(clean, [l5, c6])
 	for e in (email,):
 		frappe.delete_doc("User", e, force=True, ignore_permissions=True, delete_permanently=True)
 	frappe.db.commit()
-	needles = ["990000003", "99000000041", "99000000042", "99000000043", "99000000051", "99000000052", "99000000053", "99000000054", "Zzera", "ZZ-HELD", "ZZ-Q-S", "TR-ZZERA"]
+	needles = ["990000003", "99000000041", "99000000042", "99000000043", "99000000051", "99000000052", "99000000053", "99000000054", "99000000055", "Zzera", "ZZ-HELD", "ZZ-Q-S", "TR-ZZERA"]
 	left = ra.sweep(needles)
 	check("full-database sweep: nothing of the test subjects left (incl. Communication, Integration Request, Deleted Document, Version)", not left, str(left)[:500])
 	print(f"\n{sum(results)}/{len(results)} checks passed")

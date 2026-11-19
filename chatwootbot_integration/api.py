@@ -18,6 +18,7 @@ Nothing is scheduled here.
 
 import json
 import re
+import secrets
 
 import frappe
 from frappe import _
@@ -606,11 +607,26 @@ def _anonymise_customer(customer):
 	from frappe.model.rename_doc import rename_doc
 
 	try:
-		new_name = f"Erased-{frappe.generate_hash(length=8)}"
+		new_name = _erasure_name()
+		for _attempt in range(5):  # 48 random bits: a clash is vanishingly rare, but never overwrite
+			if not frappe.db.exists("Customer", new_name):
+				break
+			new_name = _erasure_name()
 		rename_doc("Customer", customer, new_name, force=True, ignore_permissions=True, show_alert=False)
 		return new_name
 	except Exception:
 		return None
+
+
+ERASED_NAME = re.compile(r"^Erased-[0-9a-f]{12}$")
+
+
+def _erasure_name():
+	"""`Erased-` + 12 random hex characters (48 bits from the OS CSPRNG).
+
+	Deliberately takes NO input: it is not derived from the name, phone, address or any other value of
+	the person, so there is nothing to reverse and no salt/secret to protect."""
+	return f"Erased-{secrets.token_hex(6)}"
 
 
 # ----------------------------------------------------------------- legal hold

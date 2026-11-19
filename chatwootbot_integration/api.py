@@ -8,9 +8,12 @@ A plain REST DELETE is not enough: Frappe keeps a full JSON copy of every
 deleted record in `Deleted Document`, plus `Version`, `Comment`, `Activity Log`
 and attached `File` rows. This method deletes the records, then purges those.
 
+It is plan-and-execute on ONE code path: `dry_run=True` walks exactly the steps a real
+run takes, but only records them. So the dry-run plan cannot drift from what a real run does.
+
 Where a retention purge job for leads that never claim would hook in: call
-`erase_subject` (or `erase_lead` below, which it uses) from a scheduler event
-in hooks.py once the retention rule is decided. Nothing is scheduled here.
+`erase_subject` from a scheduler event in hooks.py once the retention rule is decided.
+Nothing is scheduled here.
 """
 
 import json
@@ -23,8 +26,8 @@ from core_customizations.core_customizations.caller_gate import last_10_digits
 CLEANUP_ROLE = "Cleanup Role"
 E164 = re.compile(r"^\+[1-9][0-9]{7,14}$")
 
-# Records that belong to the subject's own footprint or are purged below; they
-# never count as "something else references the Lead".
+# Never count as "something else references the record": the subject's own footprint, or rows
+# purged below (Communication and Integration Request payloads are purged, not preserved).
 NOT_BLOCKING = {
 	"Trial Order",
 	"Contact",
@@ -41,12 +44,19 @@ NOT_BLOCKING = {
 	"CRM Notification",
 	"View Log",
 	"CRM Status Change Log",
+	"Communication",
+	"Communication Link",
+	"Integration Request",
 }
+# Children of a CRM Deal that go with it.
+DEAL_OWNED = {"CRM Task", "FCRM Note"}
 
 # (doctype, reference-doctype column, reference-name column) rows to purge for every
 # record the subject owned (deleted or anonymised).
 REFERENCE_TABLES = [
 	("Comment", "reference_doctype", "reference_name"),
+	("Communication", "reference_doctype", "reference_name"),
+	("Integration Request", "reference_doctype", "reference_docname"),
 	("Activity Log", "reference_doctype", "reference_name"),
 	("Activity Log", "timeline_doctype", "timeline_name"),
 	("Activity Log", "link_doctype", "link_name"),
@@ -60,20 +70,31 @@ REFERENCE_TABLES = [
 	("Version", "ref_doctype", "docname"),
 	("Deleted Document", "deleted_doctype", "deleted_name"),
 ]
-# Tables whose rows may carry the number itself; matched on the last 10 digits.
+# Tables whose rows may carry the number itself; matched on the last 10 digits. Each carries the
+# columns that say which document the row is about, so held documents can be excluded.
+_COMM = ("reference_doctype", "reference_name")
+_INTG = ("reference_doctype", "reference_docname")
 TEXT_TABLES = [
 	("Deleted Document", "data", ("deleted_doctype", "deleted_name")),
 	("Version", "data", ("ref_doctype", "docname")),
-	("Comment", "content", ("reference_doctype", "reference_name")),
-	("Comment", "subject", ("reference_doctype", "reference_name")),
-	("Activity Log", "subject", ("reference_doctype", "reference_name")),
-	("Activity Log", "content", ("reference_doctype", "reference_name")),
+	("Comment", "content", _COMM),
+	("Comment", "subject", _COMM),
+	("Activity Log", "subject", _COMM),
+	("Activity Log", "content", _COMM),
+	("Communication", "content", _COMM),
+	("Communication", "subject", _COMM),
+	("Communication", "phone_no", _COMM),
+	("Integration Request", "data", _INTG),
+	("Integration Request", "output", _INTG),
+	("Integration Request", "error", _INTG),
 ]
+# Deleted through delete_doc so child rows and files on disk go too.
+DELETE_VIA_DOC = {"File", "Communication"}
 
 # Legal hold: a subject whose Customer has any of these keeps the Customer (and the Contact/Address
 # those documents point at); everything else is erased as usual.
 HOLD_REASON = "sales records"
-SALES_DOCTYPES = ("Sales Order", "Sales Invoice", "Delivery Note")  # linked by `customer`
+HOLD_DOCTYPES = ("Sales Order", "Sales Invoice", "Delivery Note", "POS Invoice")  # linked by `customer`
 HOLD_CONTACT_FIELDS = ("contact_person",)
 HOLD_ADDRESS_FIELDS = ("customer_address", "shipping_address_name")
 
@@ -83,19 +104,42 @@ PERSONAL_LEAD_FIELDS = [
 	"custom_marketing_opt_in", "custom_consent_at", "custom_policy_version", "custom_first_conversation_id",
 	"custom_caller_preferences",
 ]  # fmt: skip
+PERSONAL_CUSTOMER_FIELDS = [
+	"mobile_no", "email_id", "website", "tax_id", "gstin", "pan", "image", "customer_details",
+	"customer_primary_contact", "customer_primary_address", "primary_address", "crm_deal", "lead_name",
+]  # fmt: skip
+
+
+def _flag(value):
+	if isinstance(value, str):
+		return value.strip().lower() in ("1", "true", "yes")
+	return bool(value)
 
 
 @frappe.whitelist(methods=["POST"])
-def erase_subject(mobile_no: str, bot_refs: list[str] | None = None):
+def erase_subject(
+	mobile_no: str,
+	bot_refs: list[str] | None = None,
+	dry_run: bool = False,
+	confirm_quotations: bool = False,
+):
 	"""Erase everything held about the subject with this E.164 number.
 
-	Deletes (permanently) the Trial Orders, their Address and Contact records and the
-	CRM Lead; if something else references the Lead (Deal, Call Log, Communication ...)
-	it is anonymised instead. Then purges Deleted Document / Version / Comment /
-	Activity Log / File rows. One transaction (the request), idempotent.
+	Always: the Trial Orders, the Contact/Address, the CRM Lead (anonymised instead if something
+	other than the subject's own Deals/Quotations still references it), then the Deleted Document /
+	Version / Comment / Activity Log / File / Communication / Integration Request rows.
 
-	Callable by Cleanup Role only. `bot_refs` is optional; a bot_ref only counts if
-	its Trial Order really belongs to this subject.
+	Legal hold: a Customer with any sales record (Sales Order, Sales Invoice, Delivery Note, POS
+	Invoice, Payment Entry, Journal Entry, GL Entry) is KEPT, minimised, and reported under `held`.
+
+	A Customer WITHOUT such records, and the subject's Deals and Quotations, are erased only when it
+	is safe: every Quotation draft or cancelled, every Deal still at its initial status, Customer Type
+	not Company. Otherwise only the safe part runs and `needs_review` lists why. Submitted Quotations
+	are cancelled and deleted only with `confirm_quotations=True` (Company customers and later-stage
+	Deals always stay for a human).
+
+	`dry_run=True` changes nothing and returns {would_delete, would_anonymise, would_cancel, held,
+	needs_review, retained, would_purge}. One transaction, idempotent. Callable by Cleanup Role only.
 	"""
 	frappe.only_for(CLEANUP_ROLE)
 
@@ -106,70 +150,8 @@ def erase_subject(mobile_no: str, bot_refs: list[str] | None = None):
 		bot_refs = json.loads(bot_refs) if bot_refs.strip() else []
 	bot_refs = [r.strip() for r in (bot_refs or []) if r and r.strip()]
 
-	result = {"deleted": [], "anonymised": [], "retained": [], "held": [], "skipped_bot_refs": [], "purged": {}}
-	owned = []  # (doctype, name) of everything the subject owned, deleted or anonymised
-
-	leads = _find_leads(mobile_no)
-	orders = _find_trial_orders(mobile_no, leads, bot_refs, result)
-	contacts = _find_contacts(mobile_no, leads)
-
-	# Addresses: referenced by a Trial Order, linked to a lead/contact, or carrying the number.
-	addresses = set(frappe.get_all("Address", filters={"phone": mobile_no}, pluck="name"))
-	order_docs = [frappe.get_doc("Trial Order", name) for name in orders]
-	addresses |= {o.address for o in order_docs if o.address}
-	for doctype, names in (("CRM Lead", leads), ("Contact", contacts)):
-		addresses |= _linked_parents("Address", doctype, names)
-
-	# Legal hold: a Customer with sales records is kept, with the Contact/Address those records use.
-	held = _find_held_customers(mobile_no, contacts, result)
-	protected = set()  # (doctype, name) of held documents: never purged, never erased
-	keep = {"Contact": set(), "Address": set()}
-	if held:
-		protected |= {("Customer", c) for c in held}
-		for records in held.values():
-			protected |= set(records)
-		used_contacts, used_addresses = _used_by_sales_records(held)
-		keep["Contact"] = contacts & used_contacts
-		keep["Address"] = addresses & used_addresses
-		contacts -= keep["Contact"]
-		addresses -= keep["Address"]
-		protected |= {("Contact", n) for n in keep["Contact"]} | {("Address", n) for n in keep["Address"]}
-
-	for o in order_docs:
-		owned.append(("Trial Order", o.name))
-		frappe.delete_doc(
-			"Trial Order", o.name, force=True, ignore_permissions=True, delete_permanently=True
-		)
-		result["deleted"].append({"doctype": "Trial Order", "name": o.name})
-
-	for doctype, names in (("Address", addresses), ("Contact", contacts)):
-		for name in sorted(names):
-			outcome = _erase_attached(doctype, name, set(leads), held)
-			owned.append((doctype, name))
-			result[outcome[0]].append(outcome[1])
-
-	for lead in leads:
-		owned.append(("CRM Lead", lead))
-		blockers = _lead_references(lead)
-		if blockers:
-			_anonymise_lead(lead)
-			result["anonymised"].append(
-				{"doctype": "CRM Lead", "name": lead, "referenced_by": blockers}
-			)
-		else:
-			frappe.delete_doc(
-				"CRM Lead", lead, force=True, ignore_permissions=True, delete_permanently=True
-			)
-			result["deleted"].append({"doctype": "CRM Lead", "name": lead})
-
-	if held:
-		_finish_hold(held, keep, leads, result)
-
-	# Purge LAST: deleting the records above can itself write Comment/Version/feed rows.
-	result["purged"] = _purge(owned, mobile_no, bot_refs, protected)
-	if not result["held"]:
-		del result["held"]
-	return result
+	ctx = _discover(mobile_no, bot_refs)
+	return _process(ctx, execute=not _flag(dry_run), confirm=_flag(confirm_quotations))
 
 
 # ----------------------------------------------------------------- finding
@@ -177,6 +159,50 @@ def erase_subject(mobile_no: str, bot_refs: list[str] | None = None):
 
 def _phone_match(column):
 	return f"right(regexp_replace(ifnull({column}, ''), '[^0-9]', ''), 10) = %(last10)s"
+
+
+def _discover(mobile_no, bot_refs):
+	"""Read-only: who and what belongs to this number."""
+	ctx = frappe._dict(mobile_no=mobile_no, bot_refs=bot_refs, skipped=[])
+	ctx.leads = list(_find_leads(mobile_no))
+	ctx.orders = _find_trial_orders(mobile_no, ctx.leads, bot_refs, ctx.skipped)
+	ctx.contacts = _find_contacts(mobile_no, ctx.leads)
+
+	# Addresses: referenced by a Trial Order, linked to a lead/contact, or carrying the number.
+	addresses = set(frappe.get_all("Address", filters={"phone": mobile_no}, pluck="name"))
+	for o in ctx.orders:
+		address = frappe.db.get_value("Trial Order", o, "address")
+		if address:
+			addresses.add(address)
+	for doctype, names in (("CRM Lead", ctx.leads), ("Contact", ctx.contacts)):
+		addresses |= _linked_parents("Address", doctype, names)
+	ctx.addresses = addresses
+
+	# Customers: held (sales records) or plain.
+	ctx.held, ctx.plain = {}, []
+	for customer in _find_customers(mobile_no, ctx.contacts):
+		info = _sales_records(customer)
+		if info.records or info.counts:
+			ctx.held[customer] = info
+		else:
+			ctx.plain.append(customer)
+
+	# Deals and Quotations of the subject: its Leads' Deals, its plain Customers' Deals and Quotations.
+	deals = set(frappe.get_all("CRM Deal", filters={"lead": ["in", ctx.leads]}, pluck="name")) if ctx.leads else set()
+	for customer in ctx.plain:
+		deals |= set(frappe.get_all("CRM Deal", filters={"erpnext_customer": customer}, pluck="name"))
+		crm_deal = frappe.db.get_value("Customer", customer, "crm_deal")
+		if crm_deal and frappe.db.exists("CRM Deal", crm_deal):
+			deals.add(crm_deal)
+	ctx.deals = {d: frappe.db.get_value("CRM Deal", d, "status") for d in sorted(deals)}
+	quotations = set()
+	for party_type, parties in (("CRM Deal", list(deals)), ("CRM Lead", ctx.leads), ("Customer", ctx.plain)):
+		if parties:
+			quotations |= set(
+				frappe.get_all("Quotation", filters={"quotation_to": party_type, "party_name": ["in", parties]}, pluck="name")
+			)
+	ctx.quotations = {q: frappe.db.get_value("Quotation", q, "docstatus") for q in sorted(quotations)}
+	return ctx
 
 
 def _find_leads(mobile_no):
@@ -187,15 +213,11 @@ def _find_leads(mobile_no):
 			{"last10": last10},
 			pluck=True,
 		)
-	return frappe.get_all(
-		"CRM Lead", or_filters={"mobile_no": mobile_no, "phone": mobile_no}, pluck="name"
-	)
+	return frappe.get_all("CRM Lead", or_filters={"mobile_no": mobile_no, "phone": mobile_no}, pluck="name")
 
 
 def _find_contacts(mobile_no, leads):
-	names = set(
-		frappe.get_all("Contact", or_filters={"mobile_no": mobile_no, "phone": mobile_no}, pluck="name")
-	)
+	names = set(frappe.get_all("Contact", or_filters={"mobile_no": mobile_no, "phone": mobile_no}, pluck="name"))
 	names |= set(frappe.get_all("Contact Phone", filters={"phone": mobile_no, "parenttype": "Contact"}, pluck="parent"))
 	if mobile_no.startswith("+91"):
 		last10 = last_10_digits(mobile_no)
@@ -224,68 +246,129 @@ def _linked_parents(parenttype, link_doctype, link_names):
 	)
 
 
-def _find_trial_orders(mobile_no, leads, bot_refs, result):
+def _find_trial_orders(mobile_no, leads, bot_refs, skipped):
 	orders = set()
 	if leads:
 		orders |= set(frappe.get_all("Trial Order", filters={"lead": ["in", list(leads)]}, pluck="name"))
 	orders |= set(frappe.get_all("Trial Order", filters={"mobile_no": mobile_no}, pluck="name"))
 	for ref in bot_refs:
-		row = frappe.db.get_value("Trial Order", {"bot_ref": ref}, ["name", "lead", "mobile_no"], as_dict=True)
-		if not row:
-			continue  # already gone: idempotent
-		if row.name in orders:
-			continue
+		name = frappe.db.get_value("Trial Order", {"bot_ref": ref}, "name")
+		if not name or name in orders:
+			continue  # already gone (idempotent) or already ours
 		# A bot_ref from another subject must never be erased under this subject's number.
-		result["skipped_bot_refs"].append(ref)
+		skipped.append(ref)
 	return sorted(orders)
 
 
-# ---------------------------------------------------------------- erasing
-
-
-def _erase_attached(doctype, name, subject_leads, held=None):
-	"""Delete an Address/Contact unless it is also used by something other than
-	this subject's Lead; then only unlink it and report it as retained."""
-	others = frappe.db.sql(
-		"""select link_doctype, link_name from `tabDynamic Link`
-		   where parenttype = %s and parent = %s
-		     and not (link_doctype = 'CRM Lead' and link_name in %s)
-		     and not (link_doctype = 'Customer' and link_name in %s)""",
-		(doctype, name, tuple(subject_leads) or ("",), tuple(held or ()) or ("",)),
-		as_dict=True,
-	)
-	if others:
-		if subject_leads:
+def _find_customers(mobile_no, contacts):
+	names = set()
+	if mobile_no.startswith("+91"):
+		names |= set(
 			frappe.db.sql(
-				"""delete from `tabDynamic Link` where parenttype = %s and parent = %s
-				   and link_doctype = 'CRM Lead' and link_name in %s""",
-				(doctype, name, tuple(subject_leads)),
+				f"select name from `tabCustomer` where {_phone_match('mobile_no')}",
+				{"last10": last_10_digits(mobile_no)},
+				pluck=True,
 			)
-		return "retained", {
-			"doctype": doctype,
-			"name": name,
-			"reason": "also linked to " + ", ".join(f"{o.link_doctype} {o.link_name}" for o in others),
-		}
-	frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, delete_permanently=True)
-	return "deleted", {"doctype": doctype, "name": name}
+		)
+	else:
+		names |= set(frappe.get_all("Customer", filters={"mobile_no": mobile_no}, pluck="name"))
+	if contacts:
+		names |= set(
+			frappe.get_all(
+				"Dynamic Link",
+				filters={"parenttype": "Contact", "parent": ["in", list(contacts)], "link_doctype": "Customer"},
+				pluck="link_name",
+			)
+		)
+	return sorted(names)
 
 
-def _lead_references(lead):
-	"""Things other than the subject's own footprint that point at this Lead."""
-	found = []
+def _sales_records(customer):
+	"""What makes a Customer legally held. `records` are documents we can name (and protect);
+	`counts` is the per-doctype tally, which also covers GL Entry rows (too many to list)."""
+	records, counts = [], {}
 
-	def add(doctype, name):
-		if doctype not in NOT_BLOCKING and doctype != "CRM Lead":
-			found.append(f"{doctype} {name}")
+	def add(doctype, names):
+		if names:
+			records.extend((doctype, n) for n in names)
+			counts[doctype] = counts.get(doctype, 0) + len(names)
 
-	link_fields = frappe.get_all("DocField", filters={"fieldtype": "Link", "options": "CRM Lead"}, fields=["parent", "fieldname"])
+	for doctype in HOLD_DOCTYPES:  # any docstatus: a cancelled record is still a record
+		add(doctype, frappe.get_all(doctype, filters={"customer": customer}, pluck="name"))
+	add("Payment Entry", frappe.get_all("Payment Entry", filters={"party_type": "Customer", "party": customer}, pluck="name"))
+	add(
+		"Journal Entry",
+		sorted(
+			set(
+				frappe.get_all(
+					"Journal Entry Account",
+					filters={"party_type": "Customer", "party": customer, "parenttype": "Journal Entry"},
+					pluck="parent",
+				)
+			)
+		),
+	)
+	gl = frappe.db.count("GL Entry", {"party_type": "Customer", "party": customer})
+	if gl:
+		counts["GL Entry"] = gl
+	return frappe._dict(records=records, counts=counts)
+
+
+def _used_by_sales_records(held):
+	"""Contact and Address names the held sales documents point at."""
+	contacts, addresses = set(), set()
+	for info in held.values():
+		for doctype, name in info.records:
+			meta = frappe.get_meta(doctype)
+			for fields, bucket in ((HOLD_CONTACT_FIELDS, contacts), (HOLD_ADDRESS_FIELDS, addresses)):
+				for field in fields:
+					value = meta.has_field(field) and frappe.db.get_value(doctype, name, field)
+					if value:
+						bucket.add(value)
+	return contacts, addresses
+
+
+def _initial_deal_status():
+	if frappe.db.exists("CRM Deal Status", "Qualification"):
+		return "Qualification"  # what CRM Deal.validate_status gives a new Deal
+	rows = frappe.get_all("CRM Deal Status", filters={"type": "Open"}, order_by="position", pluck="name")
+	return rows[0] if rows else None
+
+
+def _review_reasons(ctx):
+	"""[(doctype, name, reason, clearable_by_confirm)] - why a human should look first."""
+	reasons = []
+	for name, docstatus in ctx.quotations.items():
+		if docstatus == 1:
+			reasons.append(("Quotation", name, "submitted Quotation", True))
+	initial = _initial_deal_status()
+	for name, status in ctx.deals.items():
+		if status != initial:
+			reasons.append(("CRM Deal", name, f"Deal past its initial status ({status})", False))
+	for customer in ctx.plain:
+		if frappe.db.get_value("Customer", customer, "customer_type") == "Company":
+			reasons.append(("Customer", customer, "Customer Type is Company", False))
+	return reasons
+
+
+# ---------------------------------------------------------- references
+
+
+def _references(target_doctype, target_name):
+	"""(doctype, name) of every document that Links / Dynamic-Links to the target."""
+	found = set()
+	link_fields = frappe.get_all(
+		"DocField", filters={"fieldtype": "Link", "options": target_doctype}, fields=["parent", "fieldname"]
+	)
 	link_fields += [
 		{"parent": d.dt, "fieldname": d.fieldname}
-		for d in frappe.get_all("Custom Field", filters={"fieldtype": "Link", "options": "CRM Lead"}, fields=["dt", "fieldname"])
+		for d in frappe.get_all(
+			"Custom Field", filters={"fieldtype": "Link", "options": target_doctype}, fields=["dt", "fieldname"]
+		)
 	]
 	for f in link_fields:
-		for parent, name, ptype in _rows(f["parent"], f"`{f['fieldname']}` = %s", (lead,)):
-			add(ptype or f["parent"], parent or name)
+		for ref in _rows(f["parent"], f"`{f['fieldname']}` = %s", (target_name,)):
+			found.add(ref)
 
 	dyn = frappe.get_all("DocField", filters={"fieldtype": "Dynamic Link"}, fields=["parent", "fieldname", "options"])
 	dyn += [
@@ -293,13 +376,12 @@ def _lead_references(lead):
 		for d in frappe.get_all("Custom Field", filters={"fieldtype": "Dynamic Link"}, fields=["dt", "fieldname", "options"])
 	]
 	for f in dyn:
-		if not f.get("options") or f["parent"] in NOT_BLOCKING:
+		if not f.get("options"):
 			continue
-		for parent, name, ptype in _rows(
-			f["parent"], f"`{f['options']}` = 'CRM Lead' and `{f['fieldname']}` = %s", (lead,)
-		):
-			add(ptype or f["parent"], parent or name)
-	return sorted(set(found))
+		for ref in _rows(f["parent"], f"`{f['options']}` = %s and `{f['fieldname']}` = %s", (target_doctype, target_name)):
+			found.add(ref)
+	found.discard((target_doctype, target_name))
+	return found
 
 
 def _rows(doctype, condition, values):
@@ -314,7 +396,185 @@ def _rows(doctype, condition, values):
 		rows = frappe.db.sql(f"select {cols} from `tab{doctype}` where {condition}", values)
 	except Exception:
 		return []
-	return [(r[1], r[0], r[2]) for r in rows]
+	return [((r[2], r[1]) if is_child else (doctype, r[0])) for r in rows]
+
+
+def _blockers(doctype, name, gone, ignore_doctypes=()):
+	"""What still points at the record once everything already planned/done is gone."""
+	return sorted(
+		f"{dt} {n}"
+		for dt, n in _references(doctype, name)
+		if dt not in NOT_BLOCKING and dt not in ignore_doctypes and (dt, n) not in gone
+	)
+
+
+# ---------------------------------------------------------------- the run
+
+
+def _process(ctx, execute, confirm):
+	R = {"deleted": [], "anonymised": [], "cancelled": [], "retained": [], "held": [], "needs_review": []}
+	gone, owned = set(), []
+
+	def drop(doctype, name, **extra):
+		if execute:
+			frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, delete_permanently=True)
+		gone.add((doctype, name))
+		owned.append((doctype, name))
+		R["deleted"].append({"doctype": doctype, "name": name, **extra})
+
+	# --- legal hold bookkeeping
+	protected, keep = set(), {"Contact": set(), "Address": set()}
+	contacts, addresses = set(ctx.contacts), set(ctx.addresses)
+	if ctx.held:
+		protected |= {("Customer", c) for c in ctx.held}
+		for info in ctx.held.values():
+			protected |= set(info.records)
+		used_contacts, used_addresses = _used_by_sales_records(ctx.held)
+		keep["Contact"], keep["Address"] = contacts & used_contacts, addresses & used_addresses
+		contacts -= keep["Contact"]
+		addresses -= keep["Address"]
+		protected |= {("Contact", n) for n in keep["Contact"]} | {("Address", n) for n in keep["Address"]}
+
+	# --- is it safe to erase the Deals / Quotations / plain Customers?
+	reasons = _review_reasons(ctx)
+	blocking = [r for r in reasons if not r[3]]
+	confirmable = [r for r in reasons if r[3]]
+	proceed = not blocking and (not confirmable or confirm)
+	if not proceed:
+		R["needs_review"] = [
+			{"doctype": dt, "name": n, "reason": why, **({"clear_with": "confirm_quotations=True"} if ok else {})}
+			for dt, n, why, ok in reasons
+		]
+	erasing_customers = set(ctx.plain) if proceed else set()
+
+	# --- 1. Trial Orders
+	for name in ctx.orders:
+		drop("Trial Order", name)
+
+	# --- 2. Address / Contact: delete unless something else uses them
+	ignore_links = {("CRM Lead", x) for x in ctx.leads} | {("Customer", x) for x in [*ctx.held, *erasing_customers]}
+	for doctype, names in (("Address", addresses), ("Contact", contacts)):
+		for name in sorted(names):
+			others = _other_links(doctype, name, ignore_links)
+			owned.append((doctype, name))
+			if others:
+				if execute and ctx.leads:
+					_unlink_leads(doctype, [name], ctx.leads)
+				R["retained"].append(
+					{"doctype": doctype, "name": name, "reason": "also linked to " + ", ".join(others)}
+				)
+			else:
+				drop(doctype, name)
+
+	if proceed:
+		_erase_quotations_deals_customers(ctx, R, gone, owned, drop, execute)
+
+	# --- 6. Leads: delete, or anonymise if something else still points at them
+	for lead in ctx.leads:
+		blockers = _blockers("CRM Lead", lead, gone)
+		owned.append(("CRM Lead", lead))
+		if blockers:
+			if execute:
+				_anonymise_lead(lead)
+			R["anonymised"].append({"doctype": "CRM Lead", "name": lead, "referenced_by": blockers})
+		else:
+			drop("CRM Lead", lead)
+
+	# --- 7. held side
+	if ctx.held:
+		_finish_hold(ctx, keep, R, execute)
+
+	# --- 8. purge LAST: deleting the records above can itself write Comment/Version/feed rows
+	purged = _purge(owned, ctx.mobile_no, ctx.bot_refs, protected, execute)
+	return _result(R, ctx, purged, execute)
+
+
+def _result(R, ctx, purged, execute):
+	out = {"skipped_bot_refs": ctx.skipped, "retained": R["retained"]}
+	if execute:
+		out.update(deleted=R["deleted"], anonymised=R["anonymised"], purged=purged)
+		if R["cancelled"]:
+			out["cancelled"] = R["cancelled"]
+		if R["held"]:
+			out["held"] = R["held"]
+		if R["needs_review"]:
+			out["needs_review"] = R["needs_review"]
+	else:
+		out.update(
+			dry_run=True,
+			would_delete=R["deleted"],
+			would_anonymise=R["anonymised"],
+			would_cancel=R["cancelled"],
+			held=R["held"],
+			needs_review=R["needs_review"],
+			would_purge=purged,  # rows that exist now; the deletions themselves add Deleted Document/Version rows that a real run also purges
+		)
+	if R["held"]:
+		out["hold_reason"] = HOLD_REASON
+	return out
+
+
+def _other_links(doctype, name, ignore_links):
+	rows = frappe.db.sql(
+		"""select link_doctype, link_name from `tabDynamic Link` where parenttype = %s and parent = %s""",
+		(doctype, name),
+		as_dict=True,
+	)
+	return [f"{r.link_doctype} {r.link_name}" for r in rows if (r.link_doctype, r.link_name) not in ignore_links]
+
+
+def _unlink_leads(doctype, names, leads):
+	frappe.db.sql(
+		"""delete from `tabDynamic Link` where parenttype = %s and parent in %s
+		   and link_doctype = 'CRM Lead' and link_name in %s""",
+		(doctype, tuple(names), tuple(leads)),
+	)
+
+
+def _erase_quotations_deals_customers(ctx, R, gone, owned, drop, execute):
+	# --- 3. Quotations: drafts and cancelled go; submitted only with confirm_quotations
+	for name, docstatus in ctx.quotations.items():
+		blockers = _blockers("Quotation", name, gone)
+		if blockers:
+			R["retained"].append({"doctype": "Quotation", "name": name, "reason": "referenced by " + ", ".join(blockers)})
+			continue
+		try:
+			if docstatus == 1:
+				if execute:
+					quotation = frappe.get_doc("Quotation", name)
+					quotation.flags.ignore_permissions = True
+					quotation.cancel()
+				R["cancelled"].append({"doctype": "Quotation", "name": name})
+			drop("Quotation", name, docstatus=docstatus)
+		except Exception as e:  # report, do not abort the whole erasure
+			R["retained"].append({"doctype": "Quotation", "name": name, "reason": f"{type(e).__name__}: {str(e)[:160]}"})
+
+	# --- 4. Deals (with their own Tasks and Notes)
+	for name in ctx.deals:
+		owned_children = {ref for ref in _references("CRM Deal", name) if ref[0] in DEAL_OWNED}
+		blockers = _blockers("CRM Deal", name, gone | {("Customer", c) for c in ctx.plain}, ignore_doctypes=DEAL_OWNED)
+		if blockers:
+			R["retained"].append({"doctype": "CRM Deal", "name": name, "reason": "referenced by " + ", ".join(blockers)})
+			continue
+		if execute:
+			frappe.db.sql("update `tabCustomer` set crm_deal = null where crm_deal = %s", name)
+		for dt, child in sorted(owned_children):
+			drop(dt, child)
+		drop("CRM Deal", name)
+
+	# --- 5. plain Customers: delete, or anonymise if something else still points at them
+	for customer in ctx.plain:
+		blockers = _blockers("Customer", customer, gone)
+		owned.append(("Customer", customer))
+		if blockers:
+			new_name = _anonymise_customer(customer) if execute else None
+			if new_name:
+				owned.append(("Customer", new_name))
+			R["anonymised"].append(
+				{"doctype": "Customer", "name": customer, **({"renamed_to": new_name} if new_name else {}), "referenced_by": blockers}
+			)
+		else:
+			drop("Customer", customer)
 
 
 def _anonymise_lead(lead):
@@ -331,33 +591,119 @@ def _anonymise_lead(lead):
 			frappe.db.sql(f"update `tabCRM Lead` set `{column}` = null where name = %s", lead)
 
 
+def _anonymise_customer(customer):
+	"""Customer that cannot be deleted: blank it, disable it, rename the document so the person's
+	name is not the record's id. Returns the new name (or None if the rename was refused)."""
+	meta = frappe.get_meta("Customer")
+	values = {f: None for f in PERSONAL_CUSTOMER_FIELDS if meta.has_field(f)}
+	values.update({"customer_name": "Erased", "disabled": 1})
+	if meta.has_field("custom_erasure_requested_on"):
+		values["custom_erasure_requested_on"] = frappe.utils.today()
+	frappe.db.set_value("Customer", customer, values, update_modified=False)
+	for column in ("_comments", "_assign", "_liked_by", "_user_tags"):
+		if frappe.db.has_column("Customer", column):
+			frappe.db.sql(f"update `tabCustomer` set `{column}` = null where name = %s", customer)
+	from frappe.model.rename_doc import rename_doc
+
+	try:
+		new_name = f"Erased-{frappe.generate_hash(length=8)}"
+		rename_doc("Customer", customer, new_name, force=True, ignore_permissions=True, show_alert=False)
+		return new_name
+	except Exception:
+		return None
+
+
+# ----------------------------------------------------------------- legal hold
+
+
+def _finish_hold(ctx, keep, R, execute):
+	"""Unlink the erased Leads from the kept Contact/Address, minimise what is kept, mark the
+	Customer, report."""
+	if execute:
+		for doctype, names in keep.items():
+			if names and ctx.leads:
+				_unlink_leads(doctype, names, ctx.leads)
+		_minimise_held(ctx.held, keep)
+	for customer, info in ctx.held.items():
+		if execute:
+			if not frappe.db.get_value("Customer", customer, "custom_erasure_requested_on"):
+				frappe.db.set_value(
+					"Customer", customer, "custom_erasure_requested_on", frappe.utils.today(), update_modified=False
+				)
+			# never leave the Customer pointing at a Contact/Address we deleted
+			for field, doctype, text in (
+				("customer_primary_contact", "Contact", None),
+				("customer_primary_address", "Address", "primary_address"),
+			):
+				value = frappe.db.get_value("Customer", customer, field)
+				if value and not frappe.db.exists(doctype, value):
+					frappe.db.set_value("Customer", customer, field, None, update_modified=False)
+					if text:
+						frappe.db.set_value("Customer", customer, text, None, update_modified=False)
+		R["held"].append({"doctype": "Customer", "name": customer, "sales_records": info.counts})
+	for doctype, names in keep.items():
+		for name in sorted(names):
+			R["held"].append({"doctype": doctype, "name": name, "reason": "used by held sales documents"})
+
+
+def _minimise_held(held, keep):
+	"""Held side keeps only what the invoice itself carries (name, address). Contact channels are
+	cleared so nothing can reach the person again: phone, mobile and WhatsApp number (they live
+	in the Contact's phone rows), email, and the Address's phone/email/fax. The Customer is
+	disabled and its Contact marked unsubscribed."""
+	from frappe.contacts.doctype.address.address import get_address_display
+
+	for name in keep["Contact"]:
+		frappe.db.set_value(
+			"Contact",
+			name,
+			{"mobile_no": None, "phone": None, "email_id": None, "unsubscribed": 1},
+			update_modified=False,
+		)
+		frappe.db.delete("Contact Phone", {"parenttype": "Contact", "parent": name})
+		frappe.db.delete("Contact Email", {"parenttype": "Contact", "parent": name})
+	for name in keep["Address"]:
+		frappe.db.set_value("Address", name, {"phone": None, "email_id": None, "fax": None}, update_modified=False)
+	for customer in held:
+		values = {"mobile_no": None, "email_id": None, "disabled": 1}
+		primary = frappe.db.get_value("Customer", customer, "customer_primary_address")
+		if primary and primary in keep["Address"]:  # the rendered text shows phone/email: re-render
+			values["primary_address"] = get_address_display(frappe.get_doc("Address", primary).as_dict())
+		frappe.db.set_value("Customer", customer, values, update_modified=False)
+
+
 # ---------------------------------------------------------------- purging
 
 
-def _purge(owned, mobile_no, bot_refs, protected=()):
+def _purge(owned, mobile_no, bot_refs, protected, execute):
+	"""Remove (or, in a dry run, count) the audit/communication rows about what the subject owned."""
 	purged = {}
 
 	def count(doctype, n):
 		if n:
 			purged[doctype] = purged.get(doctype, 0) + n
 
+	owned = list(dict.fromkeys(owned))
 	for doctype, ref_dt, ref_name in REFERENCE_TABLES:
 		if not frappe.db.table_exists(doctype):
 			continue
 		for dt, name in owned:
-			if doctype == "File":  # through delete_doc so the file on disk goes too
-				for file in frappe.get_all(doctype, filters={ref_dt: dt, ref_name: name}, pluck="name"):
-					frappe.delete_doc("File", file, force=True, ignore_permissions=True, delete_permanently=True)
-					count(doctype, 1)
-				continue
-			count(doctype, _delete_where(doctype, f"`{ref_dt}` = %s and `{ref_name}` = %s", (dt, name)))
+			count(doctype, _purge_rows(doctype, f"`{ref_dt}` = %s and `{ref_name}` = %s", [dt, name], execute))
+	# Communications can also be tied to a record only through their Communication Link rows
+	for dt, name in owned:
+		names = frappe.db.sql(
+			"select distinct parent from `tabCommunication Link` where parenttype = 'Communication' and link_doctype = %s and link_name = %s",
+			(dt, name),
+			pluck=True,
+		)
+		count("Communication", _remove_named("Communication", names, execute))
 
 	# Contact and Address names embed the person's name; Frappe's "Deleted" feed Comment
 	# for them carries that name in its text and has no reference_name to match on.
 	needles = [last_10_digits(mobile_no) or mobile_no, *bot_refs]
 	needles += [name for dt, name in owned if dt in ("Contact", "Address")]
 	for doctype, column, (ref_dt, ref_name) in TEXT_TABLES:
-		if not frappe.db.table_exists(doctype):
+		if not frappe.db.table_exists(doctype) or not frappe.db.has_column(doctype, column):
 			continue
 		for needle in needles:
 			condition, values = f"`{column}` like %s", [f"%{needle}%"]
@@ -365,14 +711,27 @@ def _purge(owned, mobile_no, bot_refs, protected=()):
 				pairs = sorted(protected)
 				condition += f" and (coalesce(`{ref_dt}`, ''), coalesce(`{ref_name}`, '')) not in (" + ", ".join(["(%s, %s)"] * len(pairs)) + ")"
 				values += [x for pair in pairs for x in pair]
-			count(doctype, _delete_where(doctype, condition, values))
+			count(doctype, _purge_rows(doctype, condition, values, execute))
 	return purged
 
 
-def _delete_where(doctype, condition, values):
+def _purge_rows(doctype, condition, values, execute):
+	if doctype in DELETE_VIA_DOC:
+		names = frappe.db.sql(f"select name from `tab{doctype}` where {condition}", values, pluck=True)
+		return _remove_named(doctype, names, execute)
 	n = frappe.db.sql(f"select count(*) from `tab{doctype}` where {condition}", values)[0][0]
-	if n:
+	if n and execute:
 		frappe.db.sql(f"delete from `tab{doctype}` where {condition}", values)
+	return n
+
+
+def _remove_named(doctype, names, execute):
+	n = 0
+	for name in names:
+		if frappe.db.exists(doctype, name):
+			if execute:
+				frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, delete_permanently=True)
+			n += 1
 	return n
 
 
@@ -509,127 +868,3 @@ def _update_lead(name, values, bypass):
 		# custom_first_intent / custom_first_conversation_id are never touched here
 		doc.save(ignore_permissions=bypass)
 	return {"name": name, "created": False, "updated_fields": changed}
-
-
-# ----------------------------------------------------------------- legal hold
-
-
-def _find_held_customers(mobile_no, contacts, result):
-	"""{customer: [(doctype, name), ...]} for the subject's Customers that have sales records.
-	A Customer WITHOUT sales records is not touched here and is reported as retained."""
-	names = set()
-	if mobile_no.startswith("+91"):
-		names |= set(
-			frappe.db.sql(
-				f"select name from `tabCustomer` where {_phone_match('mobile_no')}",
-				{"last10": last_10_digits(mobile_no)},
-				pluck=True,
-			)
-		)
-	else:
-		names |= set(frappe.get_all("Customer", filters={"mobile_no": mobile_no}, pluck="name"))
-	if contacts:
-		names |= set(
-			frappe.get_all(
-				"Dynamic Link",
-				filters={"parenttype": "Contact", "parent": ["in", list(contacts)], "link_doctype": "Customer"},
-				pluck="link_name",
-			)
-		)
-	held = {}
-	for customer in sorted(names):
-		records = _sales_records(customer)
-		if records:
-			held[customer] = records
-		else:
-			result["retained"].append(
-				{"doctype": "Customer", "name": customer, "reason": "Customer has no sales records; not erased by this method"}
-			)
-	return held
-
-
-def _sales_records(customer):
-	records = []
-	for doctype in SALES_DOCTYPES:  # any docstatus: a cancelled record is still a record
-		records += [(doctype, n) for n in frappe.get_all(doctype, filters={"customer": customer}, pluck="name")]
-	records += [
-		("Payment Entry", n)
-		for n in frappe.get_all("Payment Entry", filters={"party_type": "Customer", "party": customer}, pluck="name")
-	]
-	return records
-
-
-def _used_by_sales_records(held):
-	"""Contact and Address names the held sales documents point at."""
-	contacts, addresses = set(), set()
-	for records in held.values():
-		for doctype, name in records:
-			meta = frappe.get_meta(doctype)
-			for fields, bucket in ((HOLD_CONTACT_FIELDS, contacts), (HOLD_ADDRESS_FIELDS, addresses)):
-				for field in fields:
-					value = meta.has_field(field) and frappe.db.get_value(doctype, name, field)
-					if value:
-						bucket.add(value)
-	return contacts, addresses
-
-
-def _finish_hold(held, keep, leads, result):
-	"""Unlink the erased Leads from the kept Contact/Address, minimise what is kept, mark the
-	Customer, report."""
-	for doctype, names in keep.items():
-		if names and leads:
-			frappe.db.sql(
-				"""delete from `tabDynamic Link` where parenttype = %s and parent in %s
-				   and link_doctype = 'CRM Lead' and link_name in %s""",
-				(doctype, tuple(names), tuple(leads)),
-			)
-	_minimise_held_contacts(held, keep)
-	for customer, records in held.items():
-		if not frappe.db.get_value("Customer", customer, "custom_erasure_requested_on"):
-			frappe.db.set_value(
-				"Customer", customer, "custom_erasure_requested_on", frappe.utils.today(), update_modified=False
-			)
-		# never leave the Customer pointing at a Contact/Address we deleted
-		for field, doctype, text in (
-			("customer_primary_contact", "Contact", None),
-			("customer_primary_address", "Address", "primary_address"),
-		):
-			value = frappe.db.get_value("Customer", customer, field)
-			if value and not frappe.db.exists(doctype, value):
-				frappe.db.set_value("Customer", customer, field, None, update_modified=False)
-				if text:
-					frappe.db.set_value("Customer", customer, text, None, update_modified=False)
-		counts = {}
-		for doctype, _name in records:
-			counts[doctype] = counts.get(doctype, 0) + 1
-		result["held"].append({"doctype": "Customer", "name": customer, "sales_records": counts})
-	for doctype, names in keep.items():
-		for name in sorted(names):
-			result["held"].append({"doctype": doctype, "name": name, "reason": "used by held sales documents"})
-	result["hold_reason"] = HOLD_REASON
-
-
-def _minimise_held_contacts(held, keep):
-	"""Held side keeps only what the invoice itself carries (name, address). Contact channels are
-	cleared so nothing can reach the person again: phone, mobile and WhatsApp number (they live
-	in the Contact's phone rows), email, and the Address's phone/email/fax. The Customer is
-	disabled and its Contact marked unsubscribed."""
-	from frappe.contacts.doctype.address.address import get_address_display
-
-	for name in keep["Contact"]:
-		frappe.db.set_value(
-			"Contact",
-			name,
-			{"mobile_no": None, "phone": None, "email_id": None, "unsubscribed": 1},
-			update_modified=False,
-		)
-		frappe.db.delete("Contact Phone", {"parenttype": "Contact", "parent": name})
-		frappe.db.delete("Contact Email", {"parenttype": "Contact", "parent": name})
-	for name in keep["Address"]:
-		frappe.db.set_value("Address", name, {"phone": None, "email_id": None, "fax": None}, update_modified=False)
-	for customer in held:
-		values = {"mobile_no": None, "email_id": None, "disabled": 1}
-		primary = frappe.db.get_value("Customer", customer, "customer_primary_address")
-		if primary and primary in keep["Address"]:  # the rendered text shows phone/email: re-render
-			values["primary_address"] = get_address_display(frappe.get_doc("Address", primary).as_dict())
-		frappe.db.set_value("Customer", customer, values, update_modified=False)

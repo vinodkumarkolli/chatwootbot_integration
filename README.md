@@ -58,3 +58,19 @@ API keys are unaffected by a role change.
 Rollback: `u.add_roles("Sales User"); u.remove_roles("CRM User Custom")`, and restore the Sales User row
 in trial_order.json (git revert of the permissions commit) before `bench migrate`.
 Re-add `Sales User` BEFORE uninstalling the app (uninstall deletes the role and its assignments).
+
+## erase_subject and the legal hold
+
+`chatwootbot_integration.api.erase_subject(mobile_no, bot_refs=[])` (Cleanup Role only) erases the subject's
+Trial Orders, Address/Contact, CRM Lead (anonymised instead if a Deal, Call Log, ... references it) and the
+Deleted Document / Version / Comment / Activity Log / File / CRM Notification rows. It runs in one transaction
+and re-running it is a no-op.
+
+Legal hold: inside the method, with ignore_permissions, the subject's Customers are found (Customer.mobile_no, or a
+Customer linked from the subject's Contacts). If a Customer has any Sales Order, Sales Invoice, Delivery Note
+(any docstatus) or Payment Entry, the Lead and Trial Orders are still deleted but the Customer is KEPT, with the
+Contact/Address that those sales documents point at; `Customer.custom_erasure_requested_on` is set (once) and the
+response carries `held: [...]` and `hold_reason: "sales records"`. Everything else of the subject is erased, and
+the audit trail (Version/Comment/Activity Log) of the held documents is never purged.
+A Customer WITHOUT sales records is not deleted; it is reported under `retained`.
+There is no scheduled purge anywhere in this app.

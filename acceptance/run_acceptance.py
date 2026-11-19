@@ -228,6 +228,7 @@ def main():
 	deleted = {(d["doctype"], d["name"]) for d in m.get("deleted", [])}
 	check("8 call -> 200", c == 200, f"{c}")
 	check("8 Trial Order, Address, Contact, Lead deleted", {("Trial Order", to), ("Address", address), ("Contact", contact), ("CRM Lead", lead)} <= deleted, "")
+	check("8 subject with NO sales records: nothing held, no hold_reason", "held" not in m and "hold_reason" not in m, "")
 	c, b = clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": PHONE, "bot_refs": [BOT]})
 	m2 = b.get("message") or {}
 	check("8 second call is a no-op (200, nothing deleted/anonymised/purged)", c == 200 and not m2.get("deleted") and not m2.get("anonymised") and not m2.get("purged"), f"{c} {str(m2)[:200]}")  # fmt: skip
@@ -259,8 +260,69 @@ def main():
 	frappe.delete_doc("CRM Lead", lead3, force=True, ignore_permissions=True, delete_permanently=True)
 	frappe.db.commit()
 
+	print("\n== 8d legal hold: subject whose Customer has a submitted Sales Invoice ==")
+	PH, NAMEH, STREETH = "+919900000011", "Zzhold Testperson", "Zzhold Street 99"
+	today = frappe.utils.today()
+	c, b = sync.call("POST", "/api/resource/CRM Lead", json={"first_name": NAMEH, "mobile_no": PH, "lead_owner": owner, "status": status})
+	leadh = b.get("data", {}).get("name")
+	made = {}
+	for key, title in (("contact1", NAMEH), ("contact2", "Zzhold Other")):
+		c, b = sync.call("POST", "/api/resource/Contact", json={"first_name": title, "mobile_no": PH if key == "contact1" else None, "links": [{"link_doctype": "CRM Lead", "link_name": leadh}]})
+		made[key] = b.get("data", {}).get("name")
+	for key, line in (("address1", STREETH), ("address2", STREETH + " B")):
+		c, b = sync.call("POST", "/api/resource/Address", json={"address_title": NAMEH + key, "address_type": "Shipping", "address_line1": line, "city": "Chennai", "state": "Tamil Nadu", "country": "India", "pincode": "600001", "links": [{"link_doctype": "CRM Lead", "link_name": leadh}]})
+		made[key] = b.get("data", {}).get("name")
+	c, b = sync.call("POST", "/api/resource/Trial Order", json=order(lead=leadh, bot_ref="TR-H" + uuid.uuid4().hex[:6].upper(), address=made["address1"]))
+	toh = b.get("data", {}).get("name")
+	check("8d setup: Lead, 2 Contacts, 2 Addresses, Trial Order", all([leadh, toh, *made.values()]), f"{leadh} {toh} {made}")
+	frappe.set_user("Administrator")
+	cust = frappe.get_doc({"doctype": "Customer", "customer_name": "Zzhold Customer", "customer_group": frappe.db.get_value("Customer Group", {"is_group": 0}, "name"), "territory": frappe.db.get_value("Territory", {"is_group": 0}, "name"), "mobile_no": PH, "default_price_list": frappe.db.get_value("Price List", {"selling": 1, "enabled": 1}, "name")}).insert()  # fmt: skip
+	for key in ("contact1", "address1"):
+		d = frappe.get_doc("Contact" if key == "contact1" else "Address", made[key])
+		d.append("links", {"link_doctype": "Customer", "link_name": cust.name})
+		d.save()
+	# Sales Invoice fixture inserted at DB level as submitted (docstatus 1): the site's dispatch-first rule
+	# (BR-SALES-001) blocks a normal insert, and this way no ledger entries are created.
+	si = frappe.get_doc({"doctype": "Sales Invoice", "name": "ZZ-HOLD-SI-1", "customer": cust.name, "company": "Sravi Enterprises - Kolapakkam", "posting_date": today, "docstatus": 1, "contact_person": made["contact1"], "customer_address": made["address1"], "items": [{"doctype": "Sales Invoice Item", "item_code": item, "qty": 1, "rate": 10, "parent": "ZZ-HOLD-SI-1", "parenttype": "Sales Invoice", "parentfield": "items", "idx": 1}]})  # fmt: skip
+	si.db_insert()
+	for row in si.items:
+		row.db_insert()
+	frappe.db.commit()
+	c, b = clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": PH})
+	m = b.get("message") or {}
+	print("   response:", str(m)[:900])
+	deleted = {(d["doctype"], d["name"]) for d in m.get("deleted", [])}
+	heldset = {(d["doctype"], d["name"]) for d in m.get("held", [])}
+	check("8d call -> 200, hold_reason == 'sales records'", c == 200 and m.get("hold_reason") == "sales records", f"{c} {m.get('hold_reason')}")
+	check("8d Lead, Trial Order and the UNREFERENCED Contact/Address are deleted", {("CRM Lead", leadh), ("Trial Order", toh), ("Contact", made["contact2"]), ("Address", made["address2"])} <= deleted, str(sorted(deleted)))  # fmt: skip
+	check("8d held lists the Customer and the Contact/Address used by the invoice", {("Customer", cust.name), ("Contact", made["contact1"]), ("Address", made["address1"])} <= heldset and ("Customer", cust.name) not in deleted, str(sorted(heldset)))  # fmt: skip
+	fresh()
+	kept = all(frappe.db.exists(dt, n) for dt, n in (("Customer", cust.name), ("Contact", made["contact1"]), ("Address", made["address1"]), ("Sales Invoice", "ZZ-HOLD-SI-1")))
+	links = frappe.db.count("Dynamic Link", {"link_doctype": "CRM Lead", "link_name": leadh})
+	stamp = frappe.db.get_value("Customer", cust.name, "custom_erasure_requested_on")
+	check("8d Customer, kept Contact/Address and the invoice still exist; no link to the erased Lead; erasure date set", kept and links == 0 and str(stamp) == today, f"kept={kept} lead_links={links} custom_erasure_requested_on={stamp}")  # fmt: skip
+	c, b = clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": PH})
+	m2 = b.get("message") or {}
+	fresh()
+	check("8d second call is a no-op (nothing deleted/anonymised/purged; date unchanged)", c == 200 and not m2.get("deleted") and not m2.get("anonymised") and not m2.get("purged") and str(frappe.db.get_value("Customer", cust.name, "custom_erasure_requested_on")) == today, f"{c} {str(m2)[:200]}")  # fmt: skip
+	print("   personal data that REMAINS on the held side (table, search term, rows):")
+	for t, needle, n in sweep(["9900000011", NAMEH, STREETH]):
+		print(f"      {t:28} {needle:22} {n}")
+	# tidy: remove the held fixtures, then erase once more so no audit rows of them stay behind
+	frappe.set_user("Administrator")
+	frappe.db.delete("Sales Invoice Item", {"parent": "ZZ-HOLD-SI-1"})
+	frappe.db.delete("Sales Invoice", {"name": "ZZ-HOLD-SI-1"})
+	for dt, n in (("Contact", made["contact1"]), ("Address", made["address1"]), ("Customer", cust.name)):
+		frappe.delete_doc(dt, n, force=True, ignore_permissions=True, delete_permanently=True)
+	frappe.db.commit()
+	clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": PH})
+	# test teardown only: deleting the HELD fixtures by hand wrote audit rows nothing else purges
+	for table, column in (("Version", "data"), ("Comment", "subject"), ("Comment", "content"), ("Deleted Document", "data"), ("Activity Log", "subject")):
+		frappe.db.sql(f"delete from `tab{table}` where `{column}` like %s", "%Zzhold%")
+	frappe.db.commit()
+
 	print("\n== 9 full-database search for leftovers ==")
-	needles = [LAST10, "9900000002", "9900000004", "9900000005", NAME, NAME2, STREET, BOT, BOT2, "Zzupsert"]
+	needles = [LAST10, "9900000002", "9900000004", "9900000005", NAME, NAME2, STREET, BOT, BOT2, "Zzupsert", "9900000011", "Zzhold", "ZZ-HOLD-SI-1"]
 	fresh()
 	left = sweep(needles)
 	check("9 no table holds the test phones, names, address or bot_ref", not left, str(left)[:600])

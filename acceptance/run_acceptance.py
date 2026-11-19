@@ -246,16 +246,16 @@ def main():
 	c, b = clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": PHONE2})
 	check("8b second call no-op", c == 200 and not (b.get("message") or {}).get("deleted"), f"{c}")
 
-	print("\n== 8c Lead referenced by a Deal is anonymised, not deleted ==")
+	print("\n== 8c Lead whose Deal is past its initial status: needs_review, Lead anonymised ==")
 	c, b = sync.call("POST", "/api/resource/CRM Lead", json={"first_name": "Zzdeal Testperson", "mobile_no": "+919900000003", "lead_owner": owner, "status": status})  # fmt: skip
 	lead3 = b.get("data", {}).get("name")
-	deal = frappe.get_doc({"doctype": "CRM Deal", "lead": lead3, "status": frappe.get_all("CRM Deal Status", filters={"type": "Open"}, pluck="name")[0], "deal_owner": owner}).insert(ignore_permissions=True)  # fmt: skip
+	deal = frappe.get_doc({"doctype": "CRM Deal", "lead": lead3, "status": frappe.get_all("CRM Deal Status", filters={"type": "Ongoing"}, order_by="position", pluck="name")[0], "deal_owner": owner}).insert(ignore_permissions=True)  # fmt: skip
 	frappe.db.commit()
 	c, b = clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": "+919900000003"})
 	m = b.get("message") or {}
 	fresh()
 	vals = frappe.db.get_value("CRM Lead", lead3, ["first_name", "lead_name", "mobile_no", "email"], as_dict=True)
-	check("8c Lead anonymised (Erased, no mobile/email) and reported", c == 200 and vals and vals.first_name == "Erased" and not vals.mobile_no and m.get("anonymised"), f"{c} {dict(vals or {})} {str(m.get('anonymised'))[:200]}")  # fmt: skip
+	check("8c Lead anonymised (Erased, no mobile/email), later-stage Deal listed under needs_review and left alone", c == 200 and vals and vals.first_name == "Erased" and not vals.mobile_no and m.get("anonymised") and any(r["doctype"] == "CRM Deal" for r in m.get("needs_review", [])) and frappe.db.exists("CRM Deal", deal.name), f"{c} {dict(vals or {})} {str(m.get('anonymised'))[:200]}")  # fmt: skip
 	frappe.delete_doc("CRM Deal", deal.name, force=True, ignore_permissions=True, delete_permanently=True)
 	frappe.delete_doc("CRM Lead", lead3, force=True, ignore_permissions=True, delete_permanently=True)
 	frappe.db.commit()

@@ -50,6 +50,10 @@
   {
    "role": "Sales User",
    "read": 1
+  },
+  {
+   "role": "CRM User Custom",
+   "read": 1
   }
  ],
  "doctype": "DocType",

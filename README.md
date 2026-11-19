@@ -27,3 +27,24 @@ rows (restoring stock permissions for doctypes we copied), the role and the user
     cd sites && ../env/bin/python ../apps/chatwootbot_integration/acceptance/run_acceptance.py <site> [base_url]
 
 Uses throwaway mirror users, or the real keys if SYNC_KEY/SYNC_SECRET/CLEANUP_KEY/CLEANUP_SECRET/LEAD_OWNER are set.
+
+## Role swap for automation.crm@sravie.in (NOT done by the app; do it deliberately)
+
+`CRM User Custom` is created and permissioned by the install but assigned to nobody.
+
+Swap (dev first):
+
+    bench --site <site> console
+    >>> u = frappe.get_doc("User", "automation.crm@sravie.in")
+    >>> u.add_roles("CRM User Custom"); u.remove_roles("Sales User"); frappe.db.commit()
+
+Then smoke-test: Windmill `upsert_lead` + Trial Order create, a Sarvam test call, and
+`acceptance/run_acceptance.py` with the real keys. API keys are unaffected by a role change.
+Follow-up once swapped: remove the `Sales User` row from Trial Order's permissions (trial_order.json)
+so ordinary sales staff stop seeing Trial Orders.
+
+Rollback:
+
+    >>> u.add_roles("Sales User"); u.remove_roles("CRM User Custom"); frappe.db.commit()
+
+Re-add `Sales User` BEFORE uninstalling the app (uninstall deletes the role and its assignments).

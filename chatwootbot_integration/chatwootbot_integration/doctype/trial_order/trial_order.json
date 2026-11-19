@@ -235,6 +235,13 @@
    "report": 1
   },
   {
+   "role": "CRM User Custom",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "report": 1
+  },
+  {
    "role": "Cleanup Role",
    "read": 1,
    "delete": 1

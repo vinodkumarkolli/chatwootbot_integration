@@ -52,6 +52,8 @@ REFERENCE_TABLES = [
 	("Activity Log", "link_doctype", "link_name"),
 	("ToDo", "reference_type", "reference_name"),
 	("Notification Log", "document_type", "document_name"),
+	("CRM Notification", "reference_doctype", "reference_name"),
+	("CRM Notification", "notification_type_doctype", "notification_type_doc"),
 	("DocShare", "share_doctype", "share_name"),
 	("View Log", "reference_doctype", "reference_name"),
 	("File", "attached_to_doctype", "attached_to_name"),
@@ -339,3 +341,140 @@ def _delete_where(doctype, condition, values):
 	if n:
 		frappe.db.sql(f"delete from `tab{doctype}` where {condition}", values)
 	return n
+
+
+# =============================================================== upsert_lead
+
+SYNC_ROLE = "CRM User Custom"
+
+
+class CallerBlockedError(frappe.ValidationError):
+	"""The number is on the blocked list or is not an Indian number (BR-CRM-002).
+	HTTP 422; the message always starts with the fixed token `CALLER_BLOCKED:`."""
+
+	http_status_code = 422
+
+
+# (parameter, CRM Lead field) pairs refreshed on every call when a value is sent
+_UPDATE_FIELDS = (
+	("intent", "custom_latest_intent"),
+	("consent_at", "custom_consent_at"),
+	("policy_version", "custom_policy_version"),
+	("campaign", "custom_campaign"),
+	("chatwoot_contact_id", "custom_chatwoot_contact_id"),
+	("marketing_opt_in", "custom_marketing_opt_in"),
+	("whatsapp_verified", "custom_whatsapp_verified"),
+)
+
+
+@frappe.whitelist(methods=["POST"])
+def upsert_lead(
+	mobile_no: str,
+	first_name: str | None = None,
+	last_name: str | None = None,
+	lead_owner: str | None = None,
+	status: str | None = None,
+	campaign: str | None = None,
+	intent: str | None = None,
+	conversation_id: str | None = None,
+	consent_at: str | None = None,
+	policy_version: str | None = None,
+	chatwoot_contact_id: str | None = None,
+	marketing_opt_in: int | None = None,
+	whatsapp_verified: int | None = None,
+):
+	"""Find the CRM Lead for this E.164 number, or create it. One number, one Lead.
+
+	Reuses the Sarvam voice agent's logic rather than re-implementing it:
+	- the Lead is found on the last 10 digits of `mobile_no`/`phone`, any spelling
+	  (`voice_agent._find_lead`) and, like `caller_gate.lookup_by_phone`, WITHOUT the
+	  own/assigned-records restriction, so a Lead owned by another user is still found
+	  (a plain REST filter cannot see it) - for the configured Sarvam automation user
+	  and for CRM automation accounts holding role `CRM User Custom`; anyone
+	  else must be able to read the Lead normally;
+	- BR-CRM-002: a blocked or foreign number raises `CallerBlockedError`
+	  (HTTP 422, message `CALLER_BLOCKED: reason=...; mobile_no=...`), on create and update;
+	- BR-CRM-001 and the phone normalisation run as the CRM Lead's own hooks on insert.
+
+	On create: `lead_owner` and `status` must be sent (this app invents no defaults);
+	`custom_first_intent` is set from `intent` and `custom_first_conversation_id` from
+	`conversation_id`, once, never overwritten later.
+	On later calls: only the values sent are refreshed (latest intent, consent_at,
+	policy_version, campaign, chatwoot_contact_id, marketing_opt_in, whatsapp_verified).
+
+	Returns {"name": <CRM Lead>, "created": bool, "updated_fields": [...]}.
+	"""
+	from core_customizations.core_customizations.caller_gate import (
+		evaluate,
+		get_automation_user,
+	)
+	from core_customizations.core_customizations.phone_normalise import normalise
+	from core_customizations.core_customizations.voice_agent import _find_lead
+
+	frappe.has_permission("CRM Lead", "create", throw=True)
+
+	phone = normalise((mobile_no or "").strip())
+	if not E164.match(phone or ""):
+		frappe.throw(_("mobile_no must be E.164, e.g. +919876543210"), frappe.ValidationError)
+
+	gate = evaluate(phone)
+	if not gate["allowed"]:
+		frappe.throw(f"CALLER_BLOCKED: reason={gate['reason']}; mobile_no={phone}", CallerBlockedError)
+
+	values = {
+		"custom_campaign": campaign,
+		"custom_latest_intent": intent,
+		"custom_consent_at": consent_at,
+		"custom_policy_version": policy_version,
+		"custom_chatwoot_contact_id": chatwoot_contact_id,
+		"custom_marketing_opt_in": None if marketing_opt_in is None else int(bool(int(marketing_opt_in))),
+		"custom_whatsapp_verified": None if whatsapp_verified is None else int(bool(int(whatsapp_verified))),
+	}
+	values = {k: v for k, v in values.items() if v not in (None, "")}
+
+	bypass = frappe.session.user == get_automation_user() or SYNC_ROLE in frappe.get_roles()
+	last10 = last_10_digits(phone)
+
+	existing = _find_lead(last10)
+	if existing:
+		return _update_lead(existing.name, values, bypass)
+
+	if not lead_owner or not status or not first_name:
+		frappe.throw(
+			_("first_name, lead_owner and status are required to create a Lead."), frappe.ValidationError
+		)
+	doc = frappe.get_doc(
+		{
+			"doctype": "CRM Lead",
+			"first_name": first_name,
+			"last_name": last_name,
+			"mobile_no": phone,
+			"lead_owner": lead_owner,
+			"status": status,
+			"custom_first_intent": intent or None,
+			"custom_first_conversation_id": conversation_id or None,
+			**values,
+		}
+	)
+	try:
+		doc.insert()
+	except frappe.DuplicateEntryError:
+		# lost a race with another call for the same number: it is now an update
+		existing = _find_lead(last10)
+		if existing:
+			return _update_lead(existing.name, values, bypass)
+		raise
+	return {"name": doc.name, "created": True, "updated_fields": []}
+
+
+def _update_lead(name, values, bypass):
+	if not bypass and not frappe.has_permission("CRM Lead", "read", name):
+		frappe.throw(_("You are not permitted to access this Lead."), frappe.PermissionError)
+	doc = frappe.get_doc("CRM Lead", name)
+	changed = [f for f, v in values.items() if doc.get(f) != v]
+	if changed:
+		for f in changed:
+			doc.set(f, values[f])
+		# custom_first_intent / custom_first_conversation_id are never touched here
+		doc.save(ignore_permissions=bypass)
+	return {"name": name, "created": False, "updated_fields": changed}

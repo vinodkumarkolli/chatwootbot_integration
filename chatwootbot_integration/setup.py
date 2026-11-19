@@ -10,10 +10,13 @@ from frappe.permissions import add_permission, update_permission_property
 MODULE = "Chatwootbot Integration"
 CLEANUP_ROLE = "Cleanup Role"
 CLEANUP_USER = "automation.cleanup@sravie.in"
+CRM_ROLE = "CRM User Custom"
 
-# Cleanup Role: read + delete on these; CRM Lead also gets write (anonymising).
+OWN_DOCTYPES = ["Trial Order", "Trial Order Item", "Conversation Intent"]  # permissions live in their JSON
+
+# Cleanup Role: read + delete on these (other apps' doctypes; Trial Order's rows are in its JSON);
+# CRM Lead also gets write (anonymising).
 CLEANUP_PERMS = {
-	"Trial Order": ("read", "delete"),
 	"Contact": ("read", "delete"),
 	"Address": ("read", "delete"),
 	"CRM Lead": ("read", "delete", "write"),
@@ -23,6 +26,26 @@ CLEANUP_PERMS = {
 	"Activity Log": ("read", "delete"),
 	"File": ("read", "delete"),
 }
+
+# CRM User Custom: the role for the CRM automation account (Sarvam voice agent + the chatbot
+# sync). Built from what the Sarvam code and the sync actually use, NOT copied from Sales User.
+# Customer create, ToDo and File are deliberately absent: they are added only if a test proves
+# they are needed. No delete anywhere.
+_RWC = ("read", "write", "create")
+CRM_PERMS = {
+	**{dt: _RWC for dt in (
+		"CRM Lead", "CRM Deal", "CRM Task", "FCRM Note", "CRM Call Log", "CRM Organization",
+		"Contact", "Address", "Quotation",
+	)},
+	**{dt: ("read",) for dt in (
+		"CRM Telephony Agent", "Customer", "Item", "Price List", "Company", "Territory", "Customer Group",
+		"CRM Lead Status", "CRM Deal Status", "CRM Lead Source", "Campaign", "User",
+		"Sarvam Transfer Attempt", "Sales Taxes and Charges Template", "Account",
+	)},
+	"Blocked Contact Request": ("read", "create", "write", "submit"),
+}  # fmt: skip
+# permission rows that only apply to the user's own records
+CRM_IF_OWNER = {"Blocked Contact Request": ("write", "submit")}
 
 CRM_LEAD_FIELDS = [
 	dict(fieldname="custom_chatbot_tab", fieldtype="Tab Break", label="Chatbot"),
@@ -49,20 +72,30 @@ CRM_LEAD_FIELD_NAMES = [d["fieldname"] for d in CRM_LEAD_FIELDS]
 
 
 def before_install():
-	# The Trial Order permissions name this role, so it must exist before doctypes sync.
+	# The Trial Order permissions name these roles, so they must exist before doctypes sync.
 	ensure_role()
+	ensure_crm_role()
 
 
 def after_install():
 	setup_all()
 
 
+def heal_own_doctype_perms():
+	"""Our own doctypes take their permissions from their JSON. A Custom DocPerm copy would
+	mask it (Frappe then ignores the JSON), so make sure none exists."""
+	frappe.db.delete("Custom DocPerm", {"parent": ["in", OWN_DOCTYPES]})
+
+
 def setup_all():
+	heal_own_doctype_perms()
 	ensure_role()
+	ensure_crm_role()
 	seed_conversation_intents()
 	seed_campaign()
 	create_lead_fields()
 	grant_cleanup_permissions()
+	grant_crm_permissions()
 	ensure_cleanup_user()
 
 
@@ -103,6 +136,47 @@ def ensure_role():
 		frappe.get_doc(
 			{"doctype": "Role", "role_name": CLEANUP_ROLE, "desk_access": 0, "is_custom": 1}
 		).insert(ignore_permissions=True)
+
+
+def ensure_crm_role():
+	"""desk_access=1 so a user whose only role is this one stays a System User."""
+	if not frappe.db.exists("Role", CRM_ROLE):
+		frappe.get_doc(
+			{"doctype": "Role", "role_name": CRM_ROLE, "desk_access": 1, "is_custom": 1}
+		).insert(ignore_permissions=True)
+
+
+def grant_crm_permissions():
+	for doctype, ptypes in CRM_PERMS.items():
+		_grant_row(doctype, CRM_ROLE, ptypes, if_owner=doctype in CRM_IF_OWNER)
+
+
+def _grant_row(doctype, role, ptypes, if_owner=False):
+	"""Give `role` exactly `ptypes` on `doctype` (level 0). Writes the Custom DocPerm row
+	directly: `add_permission` re-validates the whole doctype and refuses doctypes that
+	already carry an invalid row (e.g. Blocked Contact Request: Cancel without Submit)."""
+	from frappe.permissions import setup_custom_perms
+
+	setup_custom_perms(doctype)  # copies the standard permissions first if none are custom yet
+	name = frappe.db.get_value("Custom DocPerm", {"parent": doctype, "role": role, "permlevel": 0})
+	if not name:
+		row = frappe.get_doc(
+			{
+				"doctype": "Custom DocPerm",
+				"parent": doctype,
+				"parenttype": "DocType",
+				"parentfield": "permissions",
+				"role": role,
+				"permlevel": 0,
+			}
+		)
+		row.flags.ignore_validate = True
+		row.insert(ignore_permissions=True)
+		name = row.name
+	values = {p: int(p in ptypes) for p in ("read", "write", "create", "delete", "submit", "cancel", "amend")}
+	values["if_owner"] = int(if_owner)
+	frappe.db.set_value("Custom DocPerm", name, values, update_modified=False)
+	frappe.clear_cache(doctype=doctype)
 
 
 def create_lead_fields():
@@ -157,15 +231,16 @@ def before_uninstall():
 	for fieldname in CRM_LEAD_FIELD_NAMES:
 		if frappe.db.has_column("CRM Lead", fieldname):
 			frappe.db.sql_ddl(f"alter table `tabCRM Lead` drop column `{fieldname}`")
-	frappe.db.delete("Custom DocPerm", {"parent": ["in", ["Trial Order", "Trial Order Item", "Conversation Intent"]]})
-	frappe.db.delete("Custom DocPerm", {"role": CLEANUP_ROLE})
-	for doctype in CLEANUP_PERMS:
+	heal_own_doctype_perms()
+	frappe.db.delete("Custom DocPerm", {"role": ["in", [CLEANUP_ROLE, CRM_ROLE]]})
+	for doctype in {*CLEANUP_PERMS, *CRM_PERMS}:
 		_reset_perms_if_untouched(doctype)
 	if frappe.db.exists("User", CLEANUP_USER):
 		frappe.delete_doc("User", CLEANUP_USER, force=True, ignore_permissions=True)
-	frappe.db.delete("Has Role", {"role": CLEANUP_ROLE})
-	if frappe.db.exists("Role", CLEANUP_ROLE):
-		frappe.delete_doc("Role", CLEANUP_ROLE, force=True, ignore_permissions=True)
+	for role in (CLEANUP_ROLE, CRM_ROLE):
+		frappe.db.delete("Has Role", {"role": role})
+		if frappe.db.exists("Role", role):
+			frappe.delete_doc("Role", role, force=True, ignore_permissions=True)
 	frappe.clear_cache()
 
 

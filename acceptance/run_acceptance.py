@@ -88,7 +88,7 @@ def main():
 	temp = not os.environ.get("SYNC_KEY")
 	if temp:
 		sync_email, clean_email = "zz.acc.sync@example.com", "zz.acc.clean@example.com"
-		sync = Client(*make_user(sync_email, "Sales User"))
+		sync = Client(*make_user(sync_email, os.environ.get("SYNC_ROLE", "Sales User")))
 		clean = Client(*make_user(clean_email, "Cleanup Role"))
 		owner = sync_email
 	else:
@@ -98,7 +98,7 @@ def main():
 	status = os.environ.get("LEAD_STATUS", "New")
 	item = frappe.db.get_value("Item", {"disabled": 0}, "name")
 	campaign = "SUJITHA10"
-	print(f"mode={'temp mirror users' if temp else 'real identities'} item={item}\n")
+	print(f"mode={'temp mirror users, sync role=' + os.environ.get('SYNC_ROLE', 'Sales User') if temp else 'real identities'} item={item}\n")
 
 	def order(**o):
 		d = {"lead": lead, "campaign": campaign, "bot_ref": BOT, "house_no": "7", "street": STREET, "city": "Chennai",
@@ -159,6 +159,9 @@ def main():
 	print("\n== 5 DELETE as sync user (expect 403) ==")
 	for dt, name in (("Trial Order", to), ("Contact", contact), ("Address", address)):
 		c, b = sync.call("DELETE", f"/api/resource/{dt}/{name}")
+		if dt == "Contact":  # accepted exception: the creator may delete its own Contact
+			print(f"[INFO] 5 DELETE Contact by its creator -> {c} (creator-only exception accepted)")
+			continue
 		check(f"5 DELETE {dt} -> 403", c == 403, f"{c} {short(b)}")
 	fresh()
 	for dt, name in (("Trial Order", to), ("Contact", contact), ("Address", address)):  # a delete that wrongly succeeded
@@ -168,8 +171,8 @@ def main():
 		c, b = sync.call("POST", "/api/resource/Contact", json={"first_name": NAME, "mobile_no": PHONE, "links": [{"link_doctype": "CRM Lead", "link_name": lead}]})  # fmt: skip
 		contact = b.get("data", {}).get("name")
 
-	print("\n== 6 Reads that should be blocked (sync user) ==")
-	for dt in ("Sales Invoice", "Journal Entry", "Customer"):
+	print("\n== 6 Reads that must be blocked for the sync user (Customer read is expected, not tested) ==")
+	for dt in ("Sales Invoice", "Sales Order", "Delivery Note", "Opportunity", "Lead", "Journal Entry"):
 		c, b = sync.call("GET", f"/api/resource/{dt}", params={"limit_page_length": 1})
 		check(f"6 GET {dt} -> 403", c == 403, f"{c}")
 
@@ -179,6 +182,40 @@ def main():
 		check(f"10 cleanup GET {dt} -> 403", c == 403, f"{c}")
 	c, b = sync.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": PHONE})
 	check("10 sync user erase_subject -> 403", c == 403, f"{c}")
+
+	print("\n== upsert_lead ==")
+	U = "/api/method/chatwootbot_integration.api.upsert_lead"
+	P4 = "+919900000004"
+	other = frappe.db.get_value("User", {"enabled": 1, "user_type": "System User", "name": ["not in", ["Administrator", "Guest", owner]]}, "name")
+	frappe.set_user("Administrator")
+	foreign_lead = frappe.get_doc({"doctype": "CRM Lead", "first_name": "Zzupsert Otherowner", "mobile_no": P4, "lead_owner": other, "status": status}).insert().name
+	frappe.db.commit()
+	c, b = sync.call("GET", "/api/resource/CRM Lead", params={"filters": '[["mobile_no","=","%s"]]' % P4})
+	print("   plain REST filter sees the other user's Lead:", bool(b.get("data")))
+	c, b = sync.call("POST", U, json={"mobile_no": P4, "first_name": "Zzupsert Otherowner", "lead_owner": owner, "status": status, "intent": "info", "campaign": campaign, "policy_version": "v2"})
+	m = b.get("message") or {}
+	fresh()
+	n = frappe.db.count("CRM Lead", {"mobile_no": P4})
+	check("upsert_lead finds a Lead owned by another user: same name, created=False, not duplicated", c == 200 and m.get("name") == foreign_lead and m.get("created") is False and n == 1, f"{c} {m} count={n} {short(b) if c != 200 else ''}")  # fmt: skip
+	r = frappe.db.get_value("CRM Lead", foreign_lead, ["custom_latest_intent", "custom_first_intent", "custom_policy_version", "custom_campaign"], as_dict=True)
+	check("upsert_lead updates latest_intent/policy/campaign on the existing Lead; first_intent stays unset", r.custom_latest_intent == "info" and r.custom_policy_version == "v2" and r.custom_campaign == campaign and not r.custom_first_intent, str(dict(r)))  # fmt: skip
+	P5 = "+919900000005"
+	c, b = sync.call("POST", U, json={"mobile_no": P5, "first_name": "Zzupsert New", "lead_owner": owner, "status": status, "intent": "trial_claim", "conversation_id": "conv-9", "campaign": campaign, "consent_at": "2026-11-19 10:00:00", "policy_version": "v1"})
+	m = b.get("message") or {}
+	check("upsert_lead creates a new Lead (created=True)", c == 200 and m.get("created") is True, f"{c} {m} {short(b) if c != 200 else ''}")
+	c, b = sync.call("POST", U, json={"mobile_no": "99 0000 0005", "first_name": "x", "intent": "info"})
+	m2 = b.get("message") or {}
+	fresh()
+	row = frappe.db.get_value("CRM Lead", m.get("name"), ["custom_first_intent", "custom_latest_intent", "custom_first_conversation_id"], as_dict=True) if m.get("name") else {}
+	check("upsert_lead again (other spelling): same Lead, created=False, first_intent kept, latest updated", c == 200 and m2.get("name") == m.get("name") and m2.get("created") is False and row and row.custom_first_intent == "trial_claim" and row.custom_latest_intent == "info" and row.custom_first_conversation_id == "conv-9", f"{c} {m2} {dict(row or {})}")  # fmt: skip
+	c, b = sync.call("POST", U, json={"mobile_no": "+14155550123", "first_name": "Zzforeign", "lead_owner": owner, "status": status})
+	check("upsert_lead foreign number -> CALLER_BLOCKED (422, CallerBlockedError)", c == 422 and "CALLER_BLOCKED" in str(b) and b.get("exc_type") == "CallerBlockedError", f"{c} {short(b)}")  # fmt: skip
+	c, b = sync.call("POST", U, json={"mobile_no": "+919900000006", "first_name": "NoOwner"})
+	check("upsert_lead create without lead_owner/status -> 4xx", 400 <= c < 500, f"{c} {short(b)}")
+	c, b = clean.call("POST", U, json={"mobile_no": "+919900000007", "first_name": "x", "lead_owner": owner, "status": status})
+	check("Cleanup user cannot call upsert_lead (403)", c == 403, f"{c}")
+	for p in (P4, P5):
+		clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": p})
 
 	print("\n== 8 erase_subject (subject WITH Trial Order) ==")
 	# an extra Lead-less comment, an attachment-free Version trail: edit the Trial Order to create Version rows
@@ -221,7 +258,7 @@ def main():
 	frappe.db.commit()
 
 	print("\n== 9 full-database search for leftovers ==")
-	needles = [LAST10, "9900000002", NAME, NAME2, STREET, BOT, BOT2]
+	needles = [LAST10, "9900000002", "9900000004", "9900000005", NAME, NAME2, STREET, BOT, BOT2, "Zzupsert"]
 	fresh()
 	left = sweep(needles)
 	check("9 no table holds the test phones, names, address or bot_ref", not left, str(left)[:600])

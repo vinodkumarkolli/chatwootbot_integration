@@ -574,7 +574,8 @@ def _used_by_sales_records(held):
 
 
 def _finish_hold(held, keep, leads, result):
-	"""Unlink the erased Leads from the kept Contact/Address, mark the Customer, report."""
+	"""Unlink the erased Leads from the kept Contact/Address, minimise what is kept, mark the
+	Customer, report."""
 	for doctype, names in keep.items():
 		if names and leads:
 			frappe.db.sql(
@@ -582,6 +583,7 @@ def _finish_hold(held, keep, leads, result):
 				   and link_doctype = 'CRM Lead' and link_name in %s""",
 				(doctype, tuple(names), tuple(leads)),
 			)
+	_minimise_held_contacts(held, keep)
 	for customer, records in held.items():
 		if not frappe.db.get_value("Customer", customer, "custom_erasure_requested_on"):
 			frappe.db.set_value(
@@ -605,3 +607,29 @@ def _finish_hold(held, keep, leads, result):
 		for name in sorted(names):
 			result["held"].append({"doctype": doctype, "name": name, "reason": "used by held sales documents"})
 	result["hold_reason"] = HOLD_REASON
+
+
+def _minimise_held_contacts(held, keep):
+	"""Held side keeps only what the invoice itself carries (name, address). Contact channels are
+	cleared so nothing can reach the person again: phone, mobile and WhatsApp number (they live
+	in the Contact's phone rows), email, and the Address's phone/email/fax. The Customer is
+	disabled and its Contact marked unsubscribed."""
+	from frappe.contacts.doctype.address.address import get_address_display
+
+	for name in keep["Contact"]:
+		frappe.db.set_value(
+			"Contact",
+			name,
+			{"mobile_no": None, "phone": None, "email_id": None, "unsubscribed": 1},
+			update_modified=False,
+		)
+		frappe.db.delete("Contact Phone", {"parenttype": "Contact", "parent": name})
+		frappe.db.delete("Contact Email", {"parenttype": "Contact", "parent": name})
+	for name in keep["Address"]:
+		frappe.db.set_value("Address", name, {"phone": None, "email_id": None, "fax": None}, update_modified=False)
+	for customer in held:
+		values = {"mobile_no": None, "email_id": None, "disabled": 1}
+		primary = frappe.db.get_value("Customer", customer, "customer_primary_address")
+		if primary and primary in keep["Address"]:  # the rendered text shows phone/email: re-render
+			values["primary_address"] = get_address_display(frappe.get_doc("Address", primary).as_dict())
+		frappe.db.set_value("Customer", customer, values, update_modified=False)

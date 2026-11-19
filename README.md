@@ -72,5 +72,11 @@ Customer linked from the subject's Contacts). If a Customer has any Sales Order,
 Contact/Address that those sales documents point at; `Customer.custom_erasure_requested_on` is set (once) and the
 response carries `held: [...]` and `hold_reason: "sales records"`. Everything else of the subject is erased, and
 the audit trail (Version/Comment/Activity Log) of the held documents is never purged.
-A Customer WITHOUT sales records is not deleted; it is reported under `retained`.
+Minimisation of the held side: on the held Customer and its kept Contact/Address only what the invoice itself
+carries (name, address) stays. Cleared: Customer mobile_no/email_id, the Contact's phone/mobile/WhatsApp rows and
+email rows, the Address's phone/email/fax, and the re-rendered Customer primary_address. The Customer is disabled
+and the Contact marked unsubscribed. Because the channels are gone, a repeat call can no longer find the Customer
+and is a plain no-op. NOT touched: submitted sales documents (they keep their own snapshot of the contact phone,
+email and address display), the accounting ledgers, and the names.
+A Customer WITHOUT sales records is not deleted yet; it is reported under `retained`.
 There is no scheduled purge anywhere in this app.

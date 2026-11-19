@@ -266,11 +266,15 @@ def main():
 	c, b = sync.call("POST", "/api/resource/CRM Lead", json={"first_name": NAMEH, "mobile_no": PH, "lead_owner": owner, "status": status})
 	leadh = b.get("data", {}).get("name")
 	made = {}
+	EMAILH = "zzhold@example.com"
 	for key, title in (("contact1", NAMEH), ("contact2", "Zzhold Other")):
-		c, b = sync.call("POST", "/api/resource/Contact", json={"first_name": title, "mobile_no": PH if key == "contact1" else None, "links": [{"link_doctype": "CRM Lead", "link_name": leadh}]})
+		body = {"first_name": title, "links": [{"link_doctype": "CRM Lead", "link_name": leadh}]}
+		if key == "contact1":
+			body.update({"phone_nos": [{"phone": PH, "is_primary_mobile_no": 1}], "email_ids": [{"email_id": EMAILH, "is_primary": 1}]})
+		c, b = sync.call("POST", "/api/resource/Contact", json=body)
 		made[key] = b.get("data", {}).get("name")
 	for key, line in (("address1", STREETH), ("address2", STREETH + " B")):
-		c, b = sync.call("POST", "/api/resource/Address", json={"address_title": NAMEH + key, "address_type": "Shipping", "address_line1": line, "city": "Chennai", "state": "Tamil Nadu", "country": "India", "pincode": "600001", "links": [{"link_doctype": "CRM Lead", "link_name": leadh}]})
+		c, b = sync.call("POST", "/api/resource/Address", json={"address_title": NAMEH + key, "address_type": "Shipping", "address_line1": line, "city": "Chennai", "state": "Tamil Nadu", "country": "India", "pincode": "600001", "phone": PH, "email_id": EMAILH, "links": [{"link_doctype": "CRM Lead", "link_name": leadh}]})
 		made[key] = b.get("data", {}).get("name")
 	c, b = sync.call("POST", "/api/resource/Trial Order", json=order(lead=leadh, bot_ref="TR-H" + uuid.uuid4().hex[:6].upper(), address=made["address1"]))
 	toh = b.get("data", {}).get("name")
@@ -281,9 +285,10 @@ def main():
 		d = frappe.get_doc("Contact" if key == "contact1" else "Address", made[key])
 		d.append("links", {"link_doctype": "Customer", "link_name": cust.name})
 		d.save()
+	frappe.db.set_value("Customer", cust.name, {"email_id": EMAILH, "primary_address": f"{STREETH}<br>Phone: {PH}<br>Email: {EMAILH}", "customer_primary_address": made["address1"]})
 	# Sales Invoice fixture inserted at DB level as submitted (docstatus 1): the site's dispatch-first rule
 	# (BR-SALES-001) blocks a normal insert, and this way no ledger entries are created.
-	si = frappe.get_doc({"doctype": "Sales Invoice", "name": "ZZ-HOLD-SI-1", "customer": cust.name, "company": "Sravi Enterprises - Kolapakkam", "posting_date": today, "docstatus": 1, "contact_person": made["contact1"], "customer_address": made["address1"], "items": [{"doctype": "Sales Invoice Item", "item_code": item, "qty": 1, "rate": 10, "parent": "ZZ-HOLD-SI-1", "parenttype": "Sales Invoice", "parentfield": "items", "idx": 1}]})  # fmt: skip
+	si = frappe.get_doc({"doctype": "Sales Invoice", "name": "ZZ-HOLD-SI-1", "customer": cust.name, "company": "Sravi Enterprises - Kolapakkam", "posting_date": today, "docstatus": 1, "contact_person": made["contact1"], "contact_mobile": PH, "contact_email": EMAILH, "customer_address": made["address1"], "items": [{"doctype": "Sales Invoice Item", "item_code": item, "qty": 1, "rate": 10, "parent": "ZZ-HOLD-SI-1", "parenttype": "Sales Invoice", "parentfield": "items", "idx": 1}]})  # fmt: skip
 	si.db_insert()
 	for row in si.items:
 		row.db_insert()
@@ -304,9 +309,18 @@ def main():
 	c, b = clean.call("POST", "/api/method/chatwootbot_integration.api.erase_subject", json={"mobile_no": PH})
 	m2 = b.get("message") or {}
 	fresh()
-	check("8d second call is a no-op (nothing deleted/anonymised/purged; date unchanged)", c == 200 and not m2.get("deleted") and not m2.get("anonymised") and not m2.get("purged") and str(frappe.db.get_value("Customer", cust.name, "custom_erasure_requested_on")) == today, f"{c} {str(m2)[:200]}")  # fmt: skip
+	check("8d second call is a no-op: nothing found, nothing deleted/purged, erasure date unchanged", c == 200 and not m2.get("deleted") and not m2.get("anonymised") and not m2.get("purged") and str(frappe.db.get_value("Customer", cust.name, "custom_erasure_requested_on")) == today, f"{c} {str(m2)[:200]}")  # fmt: skip
+	# minimisation of the held side
+	cu = frappe.db.get_value("Customer", cust.name, ["mobile_no", "email_id", "disabled", "primary_address"], as_dict=True)
+	co = frappe.db.get_value("Contact", made["contact1"], ["mobile_no", "phone", "email_id", "unsubscribed"], as_dict=True)
+	ad = frappe.db.get_value("Address", made["address1"], ["phone", "email_id", "fax", "address_line1"], as_dict=True)
+	rows = frappe.db.count("Contact Phone", {"parent": made["contact1"]}) + frappe.db.count("Contact Email", {"parent": made["contact1"]})
+	check("8e held Customer: mobile/email cleared, disabled", not cu.mobile_no and not cu.email_id and cu.disabled == 1, str(dict(cu)))
+	check("8e held Customer: rendered primary address no longer shows phone/email", PH not in (cu.primary_address or "") and EMAILH not in (cu.primary_address or "") and STREETH in (cu.primary_address or ""), str(cu.primary_address))  # fmt: skip
+	check("8e kept Contact: phone/mobile/WhatsApp rows and email cleared, unsubscribed, name kept", not co.mobile_no and not co.phone and not co.email_id and co.unsubscribed == 1 and rows == 0, f"{dict(co)} child_rows={rows}")  # fmt: skip
+	check("8e kept Address: phone/email/fax cleared, street kept", not ad.phone and not ad.email_id and not ad.fax and ad.address_line1 == STREETH, str(dict(ad)))  # fmt: skip
 	print("   personal data that REMAINS on the held side (table, search term, rows):")
-	for t, needle, n in sweep(["9900000011", NAMEH, STREETH]):
+	for t, needle, n in sweep(["9900000011", EMAILH, NAMEH, STREETH]):
 		print(f"      {t:28} {needle:22} {n}")
 	# tidy: remove the held fixtures, then erase once more so no audit rows of them stay behind
 	frappe.set_user("Administrator")
@@ -322,7 +336,7 @@ def main():
 	frappe.db.commit()
 
 	print("\n== 9 full-database search for leftovers ==")
-	needles = [LAST10, "9900000002", "9900000004", "9900000005", NAME, NAME2, STREET, BOT, BOT2, "Zzupsert", "9900000011", "Zzhold", "ZZ-HOLD-SI-1"]
+	needles = [LAST10, "9900000002", "9900000004", "9900000005", NAME, NAME2, STREET, BOT, BOT2, "Zzupsert", "9900000011", "Zzhold", "ZZ-HOLD-SI-1", "zzhold@example.com"]
 	fresh()
 	left = sweep(needles)
 	check("9 no table holds the test phones, names, address or bot_ref", not left, str(left)[:600])

@@ -1027,7 +1027,23 @@ def _ensure_address(lead, a, title):
 	return doc.name, True
 
 
-def _validate_claim_input(bot_ref, consent_at, address, items):
+def _trial_items(campaign):
+	"""The Campaign's own trial pack: [{"item": custom_trial_item, "qty": 1}].
+
+	Read with frappe.db.get_value, which ignores permissions: the calling identity needs no read
+	access to Campaign. The error messages start with a fixed code and carry no personal data."""
+	row = frappe.db.get_value("Campaign", campaign, ["custom_free_trial", "custom_trial_item"], as_dict=True)
+	if not row:
+		frappe.throw(f"CAMPAIGN_NOT_FOUND: {campaign}", frappe.ValidationError)
+	if not row.custom_free_trial or not row.custom_trial_item:
+		frappe.throw(f"CAMPAIGN_NO_TRIAL: {campaign}", frappe.ValidationError)
+	disabled = frappe.db.get_value("Item", row.custom_trial_item, "disabled")
+	if disabled is None or disabled:  # disabled since the Campaign was saved (or gone)
+		frappe.throw(f"TRIAL_ITEM_DISABLED: {row.custom_trial_item}", frappe.ValidationError)
+	return [{"item": row.custom_trial_item, "qty": 1}]
+
+
+def _validate_claim_input(bot_ref, consent_at, address):
 	"""Everything checkable without touching the database, so a bad request writes nothing."""
 	if not bot_ref:
 		frappe.throw(_("bot_ref is required."), frappe.ValidationError)
@@ -1038,6 +1054,9 @@ def _validate_claim_input(bot_ref, consent_at, address, items):
 			frappe.throw(_("address.{0} is required.").format(key), frappe.ValidationError)
 	if not PINCODE.match(address["pincode"]):
 		frappe.throw(_("Pincode must be 6 digits and cannot start with 0."), frappe.ValidationError)
+
+
+def _validate_items(items):
 	if not items:
 		frappe.throw(_("At least one item is required."), frappe.ValidationError)
 	for i, row in enumerate(items, start=1):
@@ -1068,7 +1087,7 @@ def record_claim(
 	intent: str,
 	consent_at: str,
 	address: dict,
-	items: list,
+	items: list | None = None,
 	last_name: str | None = None,
 	first_intent: str | None = None,
 	chatwoot_contact_id: str | None = None,
@@ -1090,6 +1109,10 @@ def record_claim(
 	  from India Compliance's pincode table.
 	- Trial Order: idempotent on `bot_ref`. If it already exists the existing documents are
 	  returned and NOTHING is created or changed (same bot_ref for another number is refused).
+	  `items` is optional: when omitted or empty it is built from the Campaign's trial pack,
+	  [{"item": Campaign.custom_trial_item, "qty": 1}] (an explicit `items` always wins). Errors
+	  (417): `CAMPAIGN_NOT_FOUND: <campaign>`, `CAMPAIGN_NO_TRIAL: <campaign>` (free trial off or no
+	  Item), `TRIAL_ITEM_DISABLED: <item>`. A replay never re-reads the Campaign.
 	- custom_trial_order_count is kept by the Trial Order itself.
 
 	Any failure rolls back everything this call created. Callable by CRM User Custom.
@@ -1101,7 +1124,7 @@ def record_claim(
 	bot_ref = (bot_ref or "").strip()
 	address = {k: (v.strip() if isinstance(v, str) else v) for k, v in _json(address, dict).items()}
 	items = _json(items, list)
-	_validate_claim_input(bot_ref, consent_at, address, items)
+	_validate_claim_input(bot_ref, consent_at, address)
 	phone = _gate_checked_phone(mobile_no)
 
 	def replay():
@@ -1122,6 +1145,8 @@ def record_claim(
 	if frappe.db.exists("Trial Order", {"bot_ref": bot_ref}):
 		return replay()
 
+	items = items or _trial_items(campaign)  # after the replay check: a repeat never re-reads the Campaign
+	_validate_items(items)
 	values = _lead_values(campaign, intent, consent_at, policy_version, chatwoot_contact_id, marketing_opt_in, whatsapp_verified)
 
 	def work():

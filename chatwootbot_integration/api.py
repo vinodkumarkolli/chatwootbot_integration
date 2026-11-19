@@ -751,7 +751,11 @@ def _remove_named(doctype, names, execute):
 	return n
 
 
-# =============================================================== upsert_lead
+# =============================================================== upsert_lead / record_claim
+
+SYNC_ROLES = ("CRM User Custom", "System Manager")
+PINCODE = re.compile(r"^[1-9][0-9]{5}$")
+
 
 class CallerBlockedError(frappe.ValidationError):
 	"""The number is on the blocked list or is not an Indian number (BR-CRM-002).
@@ -760,16 +764,50 @@ class CallerBlockedError(frappe.ValidationError):
 	http_status_code = 422
 
 
-# (parameter, CRM Lead field) pairs refreshed on every call when a value is sent
-_UPDATE_FIELDS = (
-	("intent", "custom_latest_intent"),
-	("consent_at", "custom_consent_at"),
-	("policy_version", "custom_policy_version"),
-	("campaign", "custom_campaign"),
-	("chatwoot_contact_id", "custom_chatwoot_contact_id"),
-	("marketing_opt_in", "custom_marketing_opt_in"),
-	("whatsapp_verified", "custom_whatsapp_verified"),
-)
+def _gate_checked_phone(mobile_no):
+	"""Permission, E.164 and BR-CRM-002 gate: returns the normalised number or raises."""
+	from core_customizations.core_customizations.caller_gate import evaluate
+	from core_customizations.core_customizations.phone_normalise import normalise
+
+	frappe.has_permission("CRM Lead", "create", throw=True)
+	phone = normalise((mobile_no or "").strip())
+	if not E164.match(phone or ""):
+		frappe.throw(_("mobile_no must be E.164, e.g. +919876543210"), frappe.ValidationError)
+	gate = evaluate(phone)
+	if not gate["allowed"]:
+		frappe.throw(f"CALLER_BLOCKED: reason={gate['reason']}; mobile_no={phone}", CallerBlockedError)
+	return phone
+
+
+def _bypass():
+	"""The own/assigned-records bypass: the configured Sarvam gate user ONLY."""
+	from core_customizations.core_customizations.caller_gate import get_automation_user
+
+	return frappe.session.user == get_automation_user()
+
+
+def _lead_values(campaign, intent, consent_at, policy_version, chatwoot_contact_id, marketing_opt_in, whatsapp_verified):
+	values = {
+		"custom_campaign": campaign,
+		"custom_latest_intent": intent,
+		"custom_consent_at": consent_at,
+		"custom_policy_version": policy_version,
+		"custom_chatwoot_contact_id": chatwoot_contact_id,
+		"custom_marketing_opt_in": None if marketing_opt_in is None else int(bool(int(marketing_opt_in))),
+		"custom_whatsapp_verified": None if whatsapp_verified is None else int(bool(int(whatsapp_verified))),
+	}
+	return {k: v for k, v in values.items() if v not in (None, "")}
+
+
+def _atomic(label, fn):
+	"""Run `fn` so that, if it raises, everything it wrote is rolled back (a savepoint inside the
+	request's own transaction). Background jobs queued by the undone writes find nothing to do."""
+	frappe.db.savepoint(label)
+	try:
+		return fn()
+	except Exception:
+		frappe.db.rollback(save_point=label)
+		raise
 
 
 @frappe.whitelist(methods=["POST"])
@@ -787,6 +825,7 @@ def upsert_lead(
 	chatwoot_contact_id: str | None = None,
 	marketing_opt_in: int | None = None,
 	whatsapp_verified: int | None = None,
+	with_contact: bool = False,
 ):
 	"""Find the CRM Lead for this E.164 number, or create it. One number, one Lead.
 
@@ -808,47 +847,36 @@ def upsert_lead(
 	On later calls: only the values sent are refreshed (latest intent, consent_at,
 	policy_version, campaign, chatwoot_contact_id, marketing_opt_in, whatsapp_verified).
 
-	Returns {"name": <CRM Lead>, "created": bool, "updated_fields": [...]}.
+	`with_contact=True` also finds-or-creates the Contact for the same E.164 number and links it
+	to the Lead, in the same transaction (everything is undone if either part fails).
+
+	Returns {"name": <CRM Lead>, "created": bool, "updated_fields": [...]}; with `with_contact`
+	also {"contact": <Contact>, "contact_created": bool}.
 	"""
-	from core_customizations.core_customizations.caller_gate import (
-		evaluate,
-		get_automation_user,
-	)
-	from core_customizations.core_customizations.phone_normalise import normalise
+	phone = _gate_checked_phone(mobile_no)
+	values = _lead_values(campaign, intent, consent_at, policy_version, chatwoot_contact_id, marketing_opt_in, whatsapp_verified)
+
+	def work():
+		result = _upsert_lead(phone, first_name, last_name, lead_owner, status, intent, conversation_id, values)
+		if _flag(with_contact):
+			contact, created = _ensure_contact(result["name"], phone, first_name, last_name)
+			result.update(contact=contact, contact_created=created)
+		return result
+
+	return _atomic("upsert_lead", work) if _flag(with_contact) else work()
+
+
+def _upsert_lead(phone, first_name, last_name, lead_owner, status, first_intent, conversation_id, values):
 	from core_customizations.core_customizations.voice_agent import _find_lead
 
-	frappe.has_permission("CRM Lead", "create", throw=True)
-
-	phone = normalise((mobile_no or "").strip())
-	if not E164.match(phone or ""):
-		frappe.throw(_("mobile_no must be E.164, e.g. +919876543210"), frappe.ValidationError)
-
-	gate = evaluate(phone)
-	if not gate["allowed"]:
-		frappe.throw(f"CALLER_BLOCKED: reason={gate['reason']}; mobile_no={phone}", CallerBlockedError)
-
-	values = {
-		"custom_campaign": campaign,
-		"custom_latest_intent": intent,
-		"custom_consent_at": consent_at,
-		"custom_policy_version": policy_version,
-		"custom_chatwoot_contact_id": chatwoot_contact_id,
-		"custom_marketing_opt_in": None if marketing_opt_in is None else int(bool(int(marketing_opt_in))),
-		"custom_whatsapp_verified": None if whatsapp_verified is None else int(bool(int(whatsapp_verified))),
-	}
-	values = {k: v for k, v in values.items() if v not in (None, "")}
-
-	bypass = frappe.session.user == get_automation_user()
+	bypass = _bypass()
 	last10 = last_10_digits(phone)
-
 	existing = _find_lead(last10)
 	if existing:
 		return _update_lead(existing.name, values, bypass)
 
 	if not lead_owner or not status or not first_name:
-		frappe.throw(
-			_("first_name, lead_owner and status are required to create a Lead."), frappe.ValidationError
-		)
+		frappe.throw(_("first_name, lead_owner and status are required to create a Lead."), frappe.ValidationError)
 	doc = frappe.get_doc(
 		{
 			"doctype": "CRM Lead",
@@ -857,7 +885,7 @@ def upsert_lead(
 			"mobile_no": phone,
 			"lead_owner": lead_owner,
 			"status": status,
-			"custom_first_intent": intent or None,
+			"custom_first_intent": first_intent or None,
 			"custom_first_conversation_id": conversation_id or None,
 			**values,
 		}
@@ -884,3 +912,250 @@ def _update_lead(name, values, bypass):
 		# custom_first_intent / custom_first_conversation_id are never touched here
 		doc.save(ignore_permissions=bypass)
 	return {"name": name, "created": False, "updated_fields": changed}
+
+
+def _ensure_contact(lead, phone, first_name, last_name):
+	"""The Contact for this E.164 number, linked to the Lead: found by the Sarvam lookup (last 10
+	digits, any spelling) or created. Returns (name, created)."""
+	from core_customizations.core_customizations.voice_agent import _find_contact
+
+	bypass = _bypass()
+	existing = _find_contact(last_10_digits(phone))
+	if existing:
+		linked = frappe.db.exists(
+			"Dynamic Link",
+			{"parenttype": "Contact", "parent": existing.name, "link_doctype": "CRM Lead", "link_name": lead},
+		)
+		if not linked:
+			if not bypass and not frappe.has_permission("Contact", "write", existing.name):
+				frappe.throw(_("You are not permitted to access this Contact."), frappe.PermissionError)
+			doc = frappe.get_doc("Contact", existing.name)
+			doc.append("links", {"link_doctype": "CRM Lead", "link_name": lead})
+			doc.save(ignore_permissions=bypass)
+		return existing.name, False
+
+	if not first_name:
+		first_name, last_name = frappe.db.get_value("CRM Lead", lead, ["first_name", "last_name"]) or (None, None)
+	doc = frappe.get_doc(
+		{
+			"doctype": "Contact",
+			"first_name": first_name or phone,
+			"last_name": last_name,
+			"phone_nos": [{"phone": phone, "is_primary_mobile_no": 1}],
+			"links": [{"link_doctype": "CRM Lead", "link_name": lead}],
+		}
+	)
+	doc.insert()
+	return doc.name, True
+
+
+# ------------------------------------------------------------------ record_claim
+
+
+def _json(value, kind):
+	if isinstance(value, str):
+		value = json.loads(value) if value.strip() else kind()
+	return value if isinstance(value, kind) else kind()
+
+
+def _state_from_pincode(pincode):
+	"""India Compliance's own pincode-range table (the e-Invoice master): the state when the first
+	three digits belong to exactly one state, else None (the caller must send address.state)."""
+	from india_compliance.gst_india.constants import STATE_PINCODE_MAPPING
+
+	prefix = int(pincode[:3])
+	states = []
+	for state, rng in STATE_PINCODE_MAPPING.items():
+		for lo, hi in (rng,) if isinstance(rng[0], int) else rng:
+			if lo <= prefix <= hi:
+				states.append(state)
+	return states[0] if len(states) == 1 else None
+
+
+def _norm(text):
+	return " ".join((text or "").lower().split())
+
+
+def _line_matches(stored, head):
+	"""`stored` is `head` or `head, <more>`: how record_claim writes address_line1/2."""
+	stored, head = _norm(stored), _norm(head)
+	return stored == head or stored.startswith(head + ",")
+
+
+def _ensure_address(lead, a, title):
+	"""The Address linked to the Lead that matches pincode + house_no + street, or a new one."""
+	names = frappe.get_all(
+		"Dynamic Link",
+		filters={"parenttype": "Address", "link_doctype": "CRM Lead", "link_name": lead},
+		pluck="parent",
+	)
+	for row in frappe.get_all(
+		"Address", filters={"name": ["in", names], "pincode": a["pincode"]}, fields=["name", "address_line1", "address_line2"]
+	) if names else []:
+		if _line_matches(row.address_line1, a["house_no"]) and _line_matches(row.address_line2, a["street"]):
+			return row.name, False
+
+	state = a.get("state") or _state_from_pincode(a["pincode"])
+	if not state:
+		frappe.throw(
+			_("The state cannot be derived from pincode {0}; send address.state.").format(a["pincode"]),
+			frappe.ValidationError,
+		)
+	doc = frappe.get_doc(
+		{
+			"doctype": "Address",
+			"address_title": title,
+			"address_type": "Shipping",
+			"address_line1": ", ".join(x for x in (a["house_no"], a.get("building_name")) if x),
+			"address_line2": ", ".join(x for x in (a["street"], a.get("landmark")) if x),
+			"city": a["city"],
+			"state": state,
+			"country": "India",
+			"pincode": a["pincode"],
+			"links": [{"link_doctype": "CRM Lead", "link_name": lead}],
+		}
+	)
+	doc.insert()
+	return doc.name, True
+
+
+def _validate_claim_input(bot_ref, consent_at, address, items):
+	"""Everything checkable without touching the database, so a bad request writes nothing."""
+	if not bot_ref:
+		frappe.throw(_("bot_ref is required."), frappe.ValidationError)
+	if not consent_at:
+		frappe.throw(_("consent_at is required."), frappe.ValidationError)
+	for key in ("house_no", "street", "city", "pincode"):
+		if not (address.get(key) or "").strip():
+			frappe.throw(_("address.{0} is required.").format(key), frappe.ValidationError)
+	if not PINCODE.match(address["pincode"]):
+		frappe.throw(_("Pincode must be 6 digits and cannot start with 0."), frappe.ValidationError)
+	if not items:
+		frappe.throw(_("At least one item is required."), frappe.ValidationError)
+	for i, row in enumerate(items, start=1):
+		try:
+			ok = bool(row.get("item")) and float(row.get("qty") or 0) > 0
+		except (TypeError, ValueError):
+			ok = False
+		if not ok:
+			frappe.throw(_("Item row {0}: item and a qty greater than 0 are required.").format(i), frappe.ValidationError)
+
+
+def _claim_documents(trial_order, phone):
+	row = frappe.db.get_value("Trial Order", trial_order, ["name", "lead", "address", "mobile_no"], as_dict=True)
+	from core_customizations.core_customizations.voice_agent import _find_contact
+
+	contact = _find_contact(last_10_digits(phone))
+	return row, contact.name if contact else None
+
+
+@frappe.whitelist(methods=["POST"])
+def record_claim(
+	bot_ref: str,
+	mobile_no: str,
+	first_name: str,
+	lead_owner: str,
+	status: str,
+	campaign: str,
+	intent: str,
+	consent_at: str,
+	address: dict,
+	items: list,
+	last_name: str | None = None,
+	first_intent: str | None = None,
+	chatwoot_contact_id: str | None = None,
+	chatwoot_conversation_id: str | None = None,
+	whatsapp_verified: int | None = None,
+	marketing_opt_in: int | None = None,
+	policy_version: str | None = None,
+	terms_message_id: str | None = None,
+	claim_message_id: str | None = None,
+):
+	"""Record one trial-pack claim in ONE transaction: Lead, Contact, Address, Trial Order.
+
+	- Lead and Contact: `upsert_lead`'s logic, gate and guards (CALLER_BLOCKED behaves the same;
+	  the gate user finds a Lead owned by someone else, other callers do not; first_intent and the
+	  first conversation id are set only when the Lead is created).
+	- Address: the one linked to the Lead that matches pincode + house_no + street, else a new one.
+	  Stored as address_line1 = house_no[, building_name], address_line2 = street[, landmark]; the
+	  state comes from `address.state` or, when the pincode prefix maps to exactly one state,
+	  from India Compliance's pincode table.
+	- Trial Order: idempotent on `bot_ref`. If it already exists the existing documents are
+	  returned and NOTHING is created or changed (same bot_ref for another number is refused).
+	- custom_trial_order_count is kept by the Trial Order itself.
+
+	Any failure rolls back everything this call created. Callable by CRM User Custom.
+
+	Returns {lead, contact, address, trial_order, created: {lead, contact, address, trial_order}}.
+	"""
+	frappe.only_for(SYNC_ROLES)
+
+	bot_ref = (bot_ref or "").strip()
+	address = {k: (v.strip() if isinstance(v, str) else v) for k, v in _json(address, dict).items()}
+	items = _json(items, list)
+	_validate_claim_input(bot_ref, consent_at, address, items)
+	phone = _gate_checked_phone(mobile_no)
+
+	def replay():
+		row, contact = _claim_documents(frappe.db.get_value("Trial Order", {"bot_ref": bot_ref}), phone)
+		if last_10_digits(row.mobile_no) != last_10_digits(phone):
+			frappe.throw(
+				_("DUPLICATE_BOT_REF: bot_ref {0} already belongs to another subject").format(bot_ref),
+				frappe.DuplicateEntryError,
+			)
+		return {
+			"lead": row.lead,
+			"contact": contact,
+			"address": row.address,
+			"trial_order": row.name,
+			"created": {"lead": False, "contact": False, "address": False, "trial_order": False},
+		}
+
+	if frappe.db.exists("Trial Order", {"bot_ref": bot_ref}):
+		return replay()
+
+	values = _lead_values(campaign, intent, consent_at, policy_version, chatwoot_contact_id, marketing_opt_in, whatsapp_verified)
+
+	def work():
+		lead = _upsert_lead(phone, first_name, last_name, lead_owner, status, first_intent or intent, chatwoot_conversation_id, values)
+		contact, contact_created = _ensure_contact(lead["name"], phone, first_name, last_name)
+		addr, addr_created = _ensure_address(lead["name"], address, first_name)
+		order = frappe.get_doc(
+			{
+				"doctype": "Trial Order",
+				"lead": lead["name"],
+				"campaign": campaign,
+				"bot_ref": bot_ref,
+				"intent": intent or None,
+				"address": addr,
+				"house_no": address["house_no"],
+				"building_name": address.get("building_name"),
+				"street": address["street"],
+				"landmark": address.get("landmark"),
+				"city": address["city"],
+				"pincode": address["pincode"],
+				"phone_verified": int(bool(int(whatsapp_verified or 0))),
+				"marketing_opt_in": int(bool(int(marketing_opt_in or 0))),
+				"terms_accepted_at": consent_at,
+				"policy_version": policy_version,
+				"terms_message_id": terms_message_id,
+				"claim_message_id": claim_message_id,
+				"chatwoot_conversation_id": chatwoot_conversation_id,
+				"items": [{"item": r["item"], "qty": float(r["qty"])} for r in items],
+			}
+		).insert()
+		return {
+			"lead": lead["name"],
+			"contact": contact,
+			"address": addr,
+			"trial_order": order.name,
+			"created": {"lead": lead["created"], "contact": contact_created, "address": addr_created, "trial_order": True},
+		}
+
+	try:
+		return _atomic("record_claim", work)
+	except frappe.DuplicateEntryError:
+		# another request with the same bot_ref won the race: ours is undone, return the winner's
+		if frappe.db.exists("Trial Order", {"bot_ref": bot_ref}):
+			return replay()
+		raise
